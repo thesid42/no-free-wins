@@ -19,9 +19,10 @@ Status as of October 17, 2026:
 | Workload | `logs-parse-v1`: strict parsing and aggregation with a trusted oracle |
 | Acceptance | Correct outputs, 30 timing pairs, at least 3x median speedup and a 95% bootstrap CI lower bound of at least 3x |
 | Evidence | Raw execution proofs, artifact hashes, receipts, audit, and a hash-chain ledger |
-| Local tests | 239 tests passing, including late-response and failed-call usage regressions |
+| Local tests | 325 tests passing, including late-response, failed-call usage, repo-input and fault-drill coverage |
 | B: agent orchestration | Event-built `agent_team/` state machine, retries/fallback, budgets, official ledger, and live `run` CLI |
 | Live Crusoe agents and independent model verifier | Validated with real Nemotron workers, GLM verifier, and measured Daytona acceptance |
+| Repo input | Event-built development feature; not part of the official result |
 | Shared playbook / regression growth | Placeholder interfaces; learning flow remains pending |
 | Sidecar UI | Standalone local skeleton in `ui/`; scripted chat and pipeline scenes, with backend integration deliberately deferred |
 | Official autonomous run and demo | Official session `official-20261017-3`: `verified_done`, median 3.54x, 95% CI 3.49–3.62x, receipt audit and ledger verified (sessions 1–2 failed on Daytona latency; all disclosed in PREP.md). Demo pending |
@@ -113,6 +114,55 @@ Open `http://127.0.0.1:5173`. Run `npm run check` for JavaScript syntax checks.
 
 **This is a UI skeleton, with integration intentionally deferred.** Links and instructions remain in page memory; URLs are never fetched. Chat replies and pipeline activity are local demonstrations. Downloads use the labeled `dev-live-a-20261017-2` development fixture, unrelated to the submitted link. The two-sandbox scene is proposed; the current backend evaluates candidates sequentially. No model calls, sandbox jobs, or API routes are connected, and the static server serves only an explicit UI file allowlist. `ui/src/contracts.d.ts` outlines a future integration boundary without implementing it.
 
+## Optimize your own repo (development)
+
+This is an event-built development feature, added after the freeze. It is not part of the official result, and its live validation is pending. The official result remains `official-20261017-3` on frozen commit `b99fc1f`, unchanged.
+
+Instead of the built-in `logs-parse-v1` task, point No Free Wins at a small repo (a local path or a public GitHub URL, optionally `@ref`) and name one target function plus an input generator. The agents then try to write a faster `solve(data)` that returns exactly what the target returns.
+
+```sh
+python -m optimizer_core prepare-repo --session-id my-repo-dev --repo PATH|https://github.com/owner/name[@ref] [--include package|full]
+python -m agent_team run --session-id my-repo-dev --check
+python -m agent_team run --session-id my-repo-dev --deadline 1800
+```
+
+The repo needs a `nofreewins.json` at its root. `examples/textstats/` is a tiny repo with a slow `top_words(data)`, where `data` is `{"lines": [...], "k": 10}` and the result is the top `k` `[word, count]` pairs. It ships with a generator and this spec:
+
+```json
+{
+  "target": "textstats/core.py:top_words",
+  "generator": "textstats/gen.py:generate_input",
+  "include": "package",
+  "timing_size": 40000,
+  "correctness_sizes": [0, 1, 2, 3, 5, 8, 13, 50, 200, 1000],
+  "description": "Return the k most frequent words ..."
+}
+```
+
+- `target`: `path:function`. The function takes one positional argument. Input and output must be JSON-safe. Output may contain only ints, strings, lists and objects: no floats, booleans or null.
+- `generator`: `path:function`, called as `(seed, size)`. It must be deterministic.
+- `include`: `package` (the target's top-level package) or `full` (every `.py` file, excluding tests, `.git`, virtualenvs and build directories).
+- `timing_size` sets the size of the timing workloads (each generated input must stay under 1 MiB; 40,000 words is about 300 KB and gives a baseline of roughly 0.12–0.15 s). `correctness_sizes` is optional and cycles over the 2,000 hidden cases. `description` describes the target.
+- Return lists, not tuples: the sandbox driver rejects tuples and non-string dict keys. Modules must be importable from the repo root (a `src/` layout is not supported yet).
+
+How it is handled:
+
+- Repo code (the target and the generator) never runs on the laptop. It is bundled (zlib + base64) with a small in-memory importer and runs only inside the Daytona sandbox, under the same supervisor and limits as candidates. The frozen sandbox runner is unchanged.
+- `prepare-repo` runs the generator in the sandbox to create 2,000 hidden correctness inputs and 40 timing workloads (5 warmup, 5 screen, 30 acceptance). It runs the original function in the sandbox to record the expected outputs.
+- Everything is sealed under `private/sessions/<S>.repo/` (mode 0600), with digests in the session file. The GitHub commit SHA and the bundle digest are recorded.
+- The original function is both the baseline and the oracle. Acceptance is unchanged: 30 pairs, median at least 3x and a 95% CI lower bound of at least 3x.
+- Runs on user repos are labeled "development live run on user repo; not an official session" in the ledger.
+
+Limits:
+
+- Standard-library Python only; nothing is installed.
+- Bundled source (prelude plus bundle) is at most 192 KiB, so candidates fit under the frozen 256 KiB sandbox source limit.
+- Each generated input and each trial output is at most 1 MiB.
+- Public GitHub only, shallow clone, at most 50 MiB.
+- Short workloads give noisier timing.
+
+The harness task abstraction behind this was added after the freeze. The `logs-parse-v1` behavior is unchanged and covered by the existing tests. No result, test count or live run is claimed for repo input yet: pending validation.
+
 ## What's left
 
 - [x] **B / Anmol:** `agent_team/` orchestration (planner → two distinct workers → screen → verifier → acceptance), bounded primary/retry/fallback, reserve-before-call budgets, deadlines, hash-chained official ledger, and orchestration tests. Built on October 17 with fixture models and a fake harness.
@@ -124,6 +174,7 @@ Open `http://127.0.0.1:5173`. Run `npm run check` for JavaScript syntax checks.
 - [ ] **A + joint:** validate the merged path, preserve both preparation baselines, freeze the evaluation configuration, and prepare a fresh official session before agents start.
 - [x] **Joint:** complete a live autonomous development run, audit its actual result, verify the official message ledger, and confirm cleanup.
 - [ ] **Joint:** complete the official session and a labeled live recovery drill after injected failures. The recorded successful development run used primary model calls throughout.
+- [ ] **Joint:** validate repo input live on `examples/textstats` and a GitHub URL (development feature, not part of the official result).
 - [ ] **Joint:** record the one-minute video, rehearse the three-minute demo, and submit the public repository, accessible demo, and team roster with preparation attribution.
 
 Extra workloads, a larger zoo, the paired playbook study, long-duration claims, and prize-specific integrations are stretch work. The core deliverable is one verified optimization workflow with two agents, bounded recovery, and receipts.

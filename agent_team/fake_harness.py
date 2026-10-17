@@ -20,13 +20,16 @@ REQUEST_KEYS = {"schema_version", "request_id", "session_id", "task_id",
 
 
 class FakeHarness:
-    def __init__(self, script=None):
+    def __init__(self, script=None, task_id="logs-parse-v1"):
+        if type(task_id) is not str or not 1 <= len(task_id) <= 128:
+            raise ValueError("task_id must be a 1-128 character string")
         self.script, self.calls, self._n = dict(script or {}), [], 0
+        self.task_id = task_id
 
     def _validate(self, request):
         if (type(request) is not dict or set(request) != REQUEST_KEYS or
                 type(request["schema_version"]) is not int or request["schema_version"] != 1 or
-                request["task_id"] != "logs-parse-v1" or
+                request["task_id"] != self.task_id or
                 request["mode"] not in ("screen", "acceptance")):
             raise ValueError("unsupported candidate-evaluation request")
         for key in ("request_id", "session_id"):

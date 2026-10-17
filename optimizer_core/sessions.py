@@ -37,8 +37,9 @@ def load_session(session_id, *, root="private/sessions"):
     if not path.exists():
         raise ValueError("Prepare this session before starting agents")
     data = strict_json(path.read_bytes())
+    generator = "repo_task.py" if "repo" in data else "tasks.py"
     if (data["session_id"] != session_id or
             digest(data["seed"].encode()) != data["seed_sha256"] or
-            digest(Path(__file__).with_name("tasks.py").read_bytes()) != data["generator_sha256"]):
+            digest(Path(__file__).with_name(generator).read_bytes()) != data["generator_sha256"]):
         raise ValueError("frozen session seed/generator changed; use a new session")
     return data

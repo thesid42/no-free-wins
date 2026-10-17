@@ -53,6 +53,12 @@ def main():
     prepare = commands.add_parser("prepare", help="commit private seeds before starting agents")
     prepare.add_argument("--session-id", required=True)
     prepare.add_argument("--lines", type=int, default=100_000)
+    prepare_repo = commands.add_parser(
+        "prepare-repo", help="seal a repo task (local path or GitHub URL) in the sandbox")
+    prepare_repo.add_argument("--session-id", required=True)
+    prepare_repo.add_argument("--repo", required=True, help="local directory or GitHub URL")
+    prepare_repo.add_argument("--include", choices=("package", "full"),
+                              help="override the include mode in nofreewins.json")
     evaluate_cmd = commands.add_parser("evaluate", help="B-compatible JSON evaluation")
     evaluate_cmd.add_argument("--request", type=Path)
     evaluate_cmd.add_argument("--reference", action="store_true",
@@ -90,6 +96,15 @@ def main():
     elif args.command == "prepare":
         from .sessions import prepare_session
         result = prepare_session(args.session_id, workload_lines=args.lines)
+        directory = Path("artifacts/commitments")
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / (args.session_id + ".json")).write_bytes(canonical_json(result))
+    elif args.command == "prepare-repo":
+        from .backend import verified_backend
+        from .repo_task import prepare_repo_session
+        with verified_backend() as backend:
+            result = prepare_repo_session(args.session_id, args.repo, backend=backend,
+                                          include=args.include)
         directory = Path("artifacts/commitments")
         directory.mkdir(parents=True, exist_ok=True)
         (directory / (args.session_id + ".json")).write_bytes(canonical_json(result))

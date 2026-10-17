@@ -27,6 +27,74 @@ class CandidateFailure(ValueError):
     pass
 
 
+class LogsTask:
+    """The frozen logs-parse-v1 task, exactly as it behaved before tasks were pluggable."""
+    task_id = "logs-parse-v1"
+    baseline_source = BASELINE_SOURCE
+
+    def correctness_cases(self, seed, count, full_size):
+        return correctness_cases(seed, count=count, full_size=full_size)
+
+    def expected_output(self, case):
+        return reference(case["input"])
+
+    def timing_case(self, phase, index, seed, size, counter):
+        label = f"{phase}-{counter if phase == 'warmup' else index}"
+        return {"id": label, "input": lines_for(seed, label, size)}
+
+    def executed_source(self, source):
+        return source
+
+    def artifacts(self):
+        return [("task_definition.py", Path(__file__).with_name("tasks.py").read_bytes())]
+
+
+def checked_trial(backend, origin, trial_id, source, payload, timeout, outer_timeout):
+    """One backend trial plus the identity, cleanup and proof checks every trial needs."""
+    request = TrialRequest(trial_id, source, payload, timeout,
+                           backend.environment_sha256, outer_timeout_seconds=outer_timeout)
+    result = backend.run_trial(request)
+    if result.trial_id != request.trial_id or result.origin != origin:
+        raise InfrastructureError("backend result identity/origin mismatch")
+    if (not result.cleanup_confirmed or
+            result.environment_sha256 != request.environment_sha256 or
+            not result.proof_bytes or
+            digest(result.proof_bytes) != result.measurement_proof_sha256):
+        raise InfrastructureError("missing or inconsistent execution/cleanup proof")
+    return result
+
+
+def correctness_batches(cases):
+    """The exact correctness batch plan: up to 256 cases and 1 MiB of input per trial."""
+    batch, batch_bytes = [], 0
+    for case in cases:
+        size = len(canonical_json(case))
+        if batch and (len(batch) >= 256 or batch_bytes + size > 1 << 20):
+            yield batch
+            batch, batch_bytes = [], 0
+        batch.append(case)
+        batch_bytes += size
+    if batch:
+        yield batch
+
+
+def parse_results(stdout, ids):
+    """Strict {"results": [{"id", "output"}]} envelope; every expected id exactly once."""
+    wire = strict_json(parse_output(stdout))
+    if set(wire) != {"results"} or type(wire["results"]) is not list:
+        raise ValueError("wrong result envelope")
+    expected, found = set(ids), {}
+    for row in wire["results"]:
+        if (type(row) is not dict or set(row) != {"id", "output"} or
+                type(row["id"]) is not str or row["id"] not in expected or
+                row["id"] in found):
+            raise ValueError("missing/duplicate/unknown result")
+        found[row["id"]] = row["output"]
+    if set(found) != expected:
+        raise ValueError("incomplete results")
+    return found
+
+
 def policy_findings(source):
     """Narrow evidence, not a complete intent classifier."""
     tree = ast.parse(source.decode("utf-8"))
@@ -49,8 +117,9 @@ def policy_findings(source):
 
 class Harness:
     def __init__(self, backend, *, output="artifacts/evaluations", seed=None,
-                 workload_lines=100_000, hidden_cases=2000):
+                 workload_lines=100_000, hidden_cases=2000, task=None):
         self.backend = backend
+        self.task = task or LogsTask()
         self.output = Path(output)
         self.seed = seed or secrets.token_hex(16)
         self.workload_lines, self.hidden_cases = workload_lines, hidden_cases
@@ -67,19 +136,10 @@ class Harness:
         if time.monotonic() + 60 > self.deadline:
             raise EvaluationDeadline("insufficient time for bounded remote cleanup")
         payload = canonical_json({"cases": cases})
-        request = TrialRequest(
-            f"trial-{self.trial_count:04d}", source, payload, timeout,
-            self.backend.environment_sha256,
-            outer_timeout_seconds=min(180, self.deadline - time.monotonic()))
+        trial_id = f"trial-{self.trial_count:04d}"
         self.trial_count += 1
-        result = self.backend.run_trial(request)
-        if result.trial_id != request.trial_id or result.origin != self.origin:
-            raise InfrastructureError("backend result identity/origin mismatch")
-        if (not result.cleanup_confirmed or
-                result.environment_sha256 != request.environment_sha256 or
-                not result.proof_bytes or
-                digest(result.proof_bytes) != result.measurement_proof_sha256):
-            raise InfrastructureError("missing or inconsistent execution/cleanup proof")
+        result = checked_trial(self.backend, self.origin, trial_id, source, payload, timeout,
+                               min(180, self.deadline - time.monotonic()))
         proof_path = self.directory / f"proof-{self.trial_count:04d}.json"
         proof_path.write_bytes(result.proof_bytes)
         self.artifacts.append({"path": proof_path.name,
@@ -89,44 +149,26 @@ class Harness:
         if result.exit_code != 0 or result.failure_reason:
             raise CandidateFailure("candidate_process_failed")
         try:
-            wire = strict_json(parse_output(result.stdout))
-            if set(wire) != {"results"} or type(wire["results"]) is not list:
-                raise ValueError("wrong result envelope")
             expected = {case["id"]: case for case in cases}
-            found = {}
-            for row in wire["results"]:
-                if (type(row) is not dict or set(row) != {"id", "output"} or
-                        type(row["id"]) is not str or row["id"] not in expected or
-                        row["id"] in found):
-                    raise ValueError("missing/duplicate/unknown result")
-                found[row["id"]] = row["output"]
-            if set(found) != set(expected):
-                raise ValueError("incomplete results")
+            found = parse_results(result.stdout, expected)
             for identifier, case in expected.items():
-                if canonical_json(found[identifier]) != canonical_json(reference(case["input"])):
+                if canonical_json(found[identifier]) != canonical_json(
+                        self.task.expected_output(case)):
                     raise ValueError("output mismatch")
         except (ValueError, TypeError, KeyError) as exc:
             raise CandidateFailure("output_or_schema_mismatch") from exc
         return result, digest(parse_output(result.stdout))
 
     def _correctness(self, source):
-        batch, batch_bytes = [], 0
-        for case in correctness_cases(self.seed, count=self.hidden_cases,
-                                      full_size=self.workload_lines):
-            size = len(canonical_json(case))
-            if batch and (len(batch) >= 256 or batch_bytes + size > 1 << 20):
-                self._trial(source, batch, timeout=15)
-                batch, batch_bytes = [], 0
-            batch.append(case)
-            batch_bytes += size
-        if batch:
+        for batch in correctness_batches(self.task.correctness_cases(
+                self.seed, self.hidden_cases, self.workload_lines)):
             self._trial(source, batch, timeout=15)
 
     def _pairs(self, source, phase, count):
         pairs = []
         for index in range(count):
-            case = {"id": f"{phase}-{index}",
-                    "input": lines_for(self.seed, f"{phase}-{index}", self.workload_lines)}
+            case = self.task.timing_case(phase, index, self.seed, self.workload_lines,
+                                         self.trial_count)
             order = ("baseline", "candidate") if (
                 int(digest((self.seed + case["id"]).encode()), 16) % 2) else (
                 "candidate", "baseline")
@@ -134,7 +176,7 @@ class Harness:
             for name in order:
                 try:
                     results[name] = self._trial(
-                        BASELINE_SOURCE if name == "baseline" else source, [case])
+                        self.task.baseline_source if name == "baseline" else source, [case])
                 except CandidateFailure as exc:
                     if name == "baseline":
                         raise InfrastructureError("frozen baseline failed") from exc
@@ -168,7 +210,7 @@ class Harness:
                    "candidate", "mode", "remaining_wall_seconds", "verifier"}
         if (type(request) is not dict or set(request) != allowed or
                 type(request["schema_version"]) is not int or request["schema_version"] != 1 or
-                request["task_id"] != "logs-parse-v1" or
+                request["task_id"] != self.task.task_id or
                 request["mode"] not in ("screen", "acceptance")):
             raise ValueError("unsupported candidate-evaluation request")
         for key in ("request_id", "session_id"):
@@ -199,12 +241,12 @@ class Harness:
         self.directory = self.output / uuid.uuid4().hex
         self.directory.mkdir(parents=True)
         for filename, data in (
-            ("candidate.py", source), ("baseline.py", BASELINE_SOURCE),
+            ("candidate.py", source), ("baseline.py", self.task.baseline_source),
             ("request.json", canonical_json(request)),
             ("private_inputs.json", canonical_json(
                 {"seed": self.seed, "workload_lines": self.workload_lines,
                  "hidden_cases": self.hidden_cases})),
-            ("task_definition.py", Path(__file__).with_name("tasks.py").read_bytes()),
+            *self.task.artifacts(),
             ("remote_runner.py", Path(__file__).with_name("remote_runner.py").read_bytes()),
             ("remote_driver.py", Path(__file__).with_name("remote_driver.py").read_bytes()),
             ("acceptance.py", Path(__file__).with_name("acceptance.py").read_bytes()),
@@ -235,27 +277,31 @@ class Harness:
                 raise CandidateFailure("invalid_python_source") from None
             if findings:
                 raise CandidateFailure("policy_" + findings[0])
+            executed = self.task.executed_source(source)
+            if executed != source:
+                (self.directory / "executed_candidate.py").write_bytes(executed)
+                self.artifacts.append({"path": "executed_candidate.py",
+                                       "sha256": digest(executed)})
             if request["mode"] == "acceptance" and not approved:
                 raise CandidateFailure("verifier_evidence_required")
             with self._stage(180):
-                self._correctness(source)
+                self._correctness(executed)
             response["correctness_passed"] = True
             if request["mode"] == "screen":
                 with self._stage(300):
-                    pairs = self._pairs(source, "screen", 5)
+                    pairs = self._pairs(executed, "screen", 5)
                 response["screen_median_speedup"] = median(
                     pair.baseline_seconds / pair.candidate_seconds for pair in pairs)
                 response["status"] = "screened"
             else:
                 with self._stage(600):
-                    for _ in range(5):
+                    for index in range(5):
                         # Warmups use distinct data; no warmup result enters the CI.
-                        case = {"id": f"warmup-{self.trial_count}",
-                                "input": lines_for(self.seed, f"warmup-{self.trial_count}",
-                                                   self.workload_lines)}
-                        self._trial(BASELINE_SOURCE, [case])
-                        self._trial(source, [case])
-                    pairs = self._pairs(source, "acceptance", 30)
+                        case = self.task.timing_case("warmup", index, self.seed,
+                                                     self.workload_lines, self.trial_count)
+                        self._trial(self.task.baseline_source, [case])
+                        self._trial(executed, [case])
+                    pairs = self._pairs(executed, "acceptance", 30)
                 # No accepted receipt while its evaluation machine is still allocated.
                 if self.origin == "measured":
                     if not self.backend.close():
@@ -317,9 +363,14 @@ def evaluate_candidate(request):
         from .backend import verified_backend
         from .sessions import load_session
         session = load_session(request.get("session_id", ""))
+        if "repo" in session:
+            from .repo_task import RepoTask
+            task = RepoTask.load(session)
+        else:
+            task = LogsTask()
         with verified_backend() as backend:
-            return Harness(backend, seed=session["seed"],
-                           workload_lines=session["workload_lines"]).evaluate_candidate(request)
+            return Harness(backend, seed=session["seed"], workload_lines=session["workload_lines"],
+                           task=task).evaluate_candidate(request)
 
 
 _default_lock = threading.RLock()

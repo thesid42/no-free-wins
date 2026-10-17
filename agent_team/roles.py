@@ -175,7 +175,7 @@ def parse_candidate(text):
             if (len(a.posonlyargs) + len(a.args) == 1 and a.vararg is None
                     and not a.kwonlyargs and a.kwarg is None):
                 return source
-    raise MalformedOutput("missing top-level solve(lines)")
+    raise MalformedOutput("missing top-level solve(<one argument>)")
 
 
 def _normalize_verdict(value):
@@ -204,7 +204,7 @@ def worker_messages(task_summary, strategy, feedback):
                 f"{task_summary}\n\nStrategy {strategy['strategy_id']}: {strategy['description']}\n\n"
                 "Public evaluation feedback so far (JSON):\n"
                 f"{json.dumps(sanitize_feedback(feedback), sort_keys=True)}\n\n"
-                "Reply with exactly one ```python block defining solve(lines).")}]
+                "Reply with exactly one ```python block defining the solve function described above.")}]
 
 
 def verifier_messages(task_summary, candidate_source, candidate_sha256):

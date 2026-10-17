@@ -1,0 +1,6 @@
+{"target": "textstats/core.py:top_words",
+ "generator": "textstats/gen.py:generate_input",
+ "include": "package",
+ "timing_size": 40000,
+ "correctness_sizes": [0, 1, 2, 3, 5, 8, 13, 50, 200, 1000],
+ "description": "Return the k most frequent words (lowercase ASCII letter runs, case-insensitive) in the given lines as [[word, count], ...], most frequent first, ties broken alphabetically. Input is {\"lines\": [str], \"k\": int}."}

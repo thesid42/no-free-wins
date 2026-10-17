@@ -515,11 +515,56 @@ class EvidenceTests(OrchestrationCase):
         self.assertEqual(self.orchestrate(harness=fake, evaluate=evaluate).state, "failed_deadline")
         self.assertEqual(self.of("terminal")[0]["reason"], "harness budget exhausted in acceptance")
 
-    def test_screen_budget_exhausted_is_failed_deadline(self):
-        harness = FakeHarness(harness_script(**{"worker_a-r1": {
-            "screen": {"status": "budget_exhausted", "screen_median_speedup": None}}}))
-        self.assertEqual(self.orchestrate(harness=harness).state, "failed_deadline")
+    def exhausted_screen_a(self):
+        return {"worker_a-r1": {"screen": {"status": "budget_exhausted",
+                                           "screen_median_speedup": None}},
+                "worker_a-r2": {"screen": {"screen_median_speedup": 4.0},
+                                "acceptance": {"acceptance": {"median_speedup": 3.6,
+                                                              "ci_lower": 3.3}}}}
+
+    def test_screen_budget_exhausted_with_time_left_fails_only_that_candidate(self):
+        a2, b2 = variant(SOURCE_A, 2), variant(SOURCE_B, 2)
+        client_script = script(**{
+            "a-primary": [fence(SOURCE_A), fence(a2)], "b-primary": [fence(SOURCE_B), fence(b2)],
+            "v-primary": [verdict(make_candidate("x", a2)["sha256"])]})
+        harness = FakeHarness(harness_script(**self.exhausted_screen_a()))
+        result = self.orchestrate(client_script, harness=harness)
+        self.assertEqual(result.state, "simulation_completed")
+        self.assertEqual(result.rounds, 2)
+        first, second = self.modes("screen")[:2]  # the other candidate was still screened
+        self.assertEqual([first["candidate"]["candidate_id"], second["candidate"]["candidate_id"]],
+                         ["worker_a-r1", "worker_b-r1"])
+        screens = self.of("screen_result")
+        self.assertEqual(screens[0]["status"], "budget_exhausted")
+        self.assertEqual(screens[1]["status"], "screened")
+        round_two = [c for c in self.client.calls if c[1] == "worker_a"][1][2]
+        self.assertIn("evaluation_deadline", json.dumps(round_two))
+        self.assertIn("screen_below_bar", json.dumps(round_two))  # worker_b really was below the bar
+
+    def test_every_screen_exhausted_does_not_blame_the_bar(self):
+        slow = {"screen": {"status": "budget_exhausted", "screen_median_speedup": None}}
+        harness = FakeHarness({f"{w}-r1": slow for w in ("worker_a", "worker_b")})
+        client_script = script(**{"a-primary": [fence(SOURCE_A), fence(variant(SOURCE_A, 2))],
+                                  "b-primary": [fence(SOURCE_B), fence(variant(SOURCE_B, 2))]})
+        self.orchestrate(client_script, harness=harness, max_rounds=2)
+        round_two = [c for c in self.client.calls if c[1] == "worker_a"][1][2]
+        self.assertIn("evaluation_deadline", json.dumps(round_two))
+        self.assertNotIn("screen_below_bar", json.dumps(round_two))
+
+    def test_screen_budget_exhausted_with_too_little_time_is_failed_deadline(self):
+        clock = FakeClock()
+        harness = FakeHarness(harness_script(**self.exhausted_screen_a()))
+
+        def evaluate(request):
+            response = harness.evaluate_candidate(request)
+            if response["status"] == "budget_exhausted":
+                clock.now += 850  # 50 s left, below the screen floor of 100 s
+            return response
+        result = self.orchestrate(evaluate=evaluate, clock=clock, harness=harness,
+                                  min_harness_seconds={"screen": 100, "acceptance": 1})
+        self.assertEqual(result.state, "failed_deadline")
         self.assertEqual(self.of("terminal")[0]["reason"], "harness budget exhausted in screen")
+        self.assertEqual(len(self.modes("screen")), 1)
 
     def test_simulated_acceptance_with_measured_origin_is_failed_evidence(self):
         fake, evaluate, _ = self.evaluator(status="simulated_acceptance", accepted=False)
@@ -642,6 +687,55 @@ class MultiRoundTests(OrchestrationCase):
         self.assertIsNone(self.of("terminal")[0]["last_forwarded_candidate_id"])
         third = [c for c in self.client.calls if c[1] == "worker_a"][2][2]
         self.assertIn("screen_below_bar", json.dumps(third))
+
+
+REPO_TASK_ID = "repo-abc123def456"
+REPO_SUMMARY = "REPO-SUMMARY-MARKER: optimize pkg.mod.solve(data)"
+
+
+class RepoTaskTests(OrchestrationCase):
+    def test_repo_task_id_reaches_every_request_and_summary_every_prompt(self):
+        harness = FakeHarness(harness_script(), task_id=REPO_TASK_ID)
+        result = self.orchestrate(harness=harness, task_id=REPO_TASK_ID, task_summary=REPO_SUMMARY)
+        self.assertEqual(result.state, "simulation_completed")
+        self.assertEqual(len(harness.calls), 3)
+        self.assertEqual({call["task_id"] for call in harness.calls}, {REPO_TASK_ID})
+        self.assertEqual(self.of("run_started")[0]["task_id"], REPO_TASK_ID)
+        roles_seen = set()
+        for _, role, messages in self.client.calls:
+            roles_seen.add(role)
+            text = json.dumps(messages)
+            self.assertIn(REPO_SUMMARY, text)
+            self.assertNotIn("logs", text)
+            if role != "verifier":  # the verifier prompt embeds the fixture candidate source
+                self.assertNotIn("solve(lines)", text)
+        self.assertEqual(roles_seen, {"planner", "worker_a", "worker_b", "verifier"})
+
+    def test_default_task_id_is_logs(self):
+        self.orchestrate()
+        self.assertEqual({call["task_id"] for call in self.harness.calls}, {"logs-parse-v1"})
+        self.assertEqual(self.of("run_started")[0]["task_id"], "logs-parse-v1")
+
+    def test_task_id_mismatch_is_failed_infrastructure(self):
+        harness = FakeHarness(harness_script(), task_id="repo-000000000000")
+        result = self.orchestrate(harness=harness, task_id=REPO_TASK_ID, task_summary=REPO_SUMMARY)
+        self.assertEqual(result.state, "failed_infrastructure")
+        self.assertEqual(self.of("harness_error")[0]["error_type"], "ValueError")
+        self.assertEqual(harness.calls, [])
+
+    def test_bad_task_id_is_rejected(self):
+        for bad in ("", "x" * 129, None, 5):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                self.orchestrate(task_id=bad)
+        with self.assertRaises(ValueError):
+            FakeHarness(task_id="")
+
+    def test_parser_error_names_a_generic_solve(self):
+        from agent_team.models import MalformedOutput
+        from agent_team.roles import parse_candidate
+        with self.assertRaisesRegex(MalformedOutput, r"solve\(<one argument>\)"):
+            parse_candidate("```python\ndef other(x):\n    return x\n```")
+        parse_candidate("```python\ndef solve(data):\n    return data\n```")
 
 
 class PrivacyTests(OrchestrationCase):

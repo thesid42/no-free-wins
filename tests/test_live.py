@@ -97,6 +97,11 @@ def no_preflight(session_id):
     return lambda: None
 
 
+def logs_session(session_id, **kw):
+    """A prepared logs session (no repo block), so tests that skip the preflight never read private/."""
+    return {"schema_version": 1, "session_id": session_id}
+
+
 class LineupTests(unittest.TestCase):
     def test_resolves_against_the_live_listing(self):
         orders = live.resolve_lineup(LIVE_IDS)
@@ -133,14 +138,31 @@ class BudgetTests(unittest.TestCase):
                 live.live_budget(orders, max_cost_usd=bad)
 
 
+class TimedListingClient(ListingClient):
+    """ListingClient that is timeout-aware: records plain and timed calls separately."""
+
+    def __init__(self, *args, **kw):
+        super().__init__(*args, **kw)
+        self.plain, self.timed = [], []
+
+    def complete(self, model_id, role, messages, max_tokens):
+        self.plain.append((model_id, role))
+        return super().complete(model_id, role, messages, max_tokens)
+
+    def complete_with_timeout(self, model_id, role, messages, max_tokens, timeout_seconds):
+        self.timed.append((model_id, role, timeout_seconds))
+        return ListingClient.complete(self, model_id, role, messages, max_tokens)
+
+
 class BuildLiveRunTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.output = Path(self.tmp.name) / "run"
-        patcher = mock.patch.object(live, "make_preflight", no_preflight)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        for patcher in (mock.patch.object(live, "make_preflight", no_preflight),
+                        mock.patch.object(sessions, "load_session", logs_session)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def build(self, client=None, **kw):
         client = client or ListingClient(run_script())
@@ -187,6 +209,68 @@ class BuildLiveRunTests(unittest.TestCase):
         self.assertEqual(records[-1]["sha256"], result.ledger_final_sha256)
         self.assertEqual(len(records), len(events))
         self.assertEqual({call[0] for call in client.calls}, {SUPER, NANO, GLM_FLASH})
+
+    def test_drill_injects_two_worker_a_failures_and_the_fallback_recovers(self):
+        evaluate = FakeEvaluate()
+        (orchestrator, info), client = self.build(evaluate=evaluate, inject_failures=True)
+        self.assertEqual(info["drill"], {"role": "worker_a", "model_id": SUPER, "failures": 2})
+        result = orchestrator.run()
+        self.assertEqual(result.state, "verified_done")
+        self.assertEqual(evaluate.calls, ["screen", "screen", "acceptance"])
+        types_ = [e["type"] for e in result.events]
+        self.assertEqual(types_[:4], ["run_started", "fault_injection", "run_label", "preflight"])
+        drill, label = result.events[1], result.events[2]
+        self.assertEqual((drill["model_id"], drill["failures"]), (SUPER, 2))
+        self.assertIn("labeled drill", drill["label"])
+        self.assertEqual(label["label"],
+                         "development live run; not an official session; labeled fault drill")
+        created = [e for e in result.events if e["type"] == "candidate_created"
+                   and e["worker"] == "worker_a"][0]
+        attempts = created["attempts"]
+        self.assertEqual([a["outcome"] for a in attempts], ["model_error", "model_error", "ok"])
+        self.assertEqual([a["model_id"] for a in attempts], [SUPER, SUPER, NANO])
+        for attempt in attempts[:2]:
+            self.assertTrue(attempt["detail"].startswith("injected fault: "))
+        self.assertEqual(orchestrator.client.injected_total, 2)
+        self.assertEqual(client.max_tokens.count(8192), len(client.max_tokens))  # inner client reached
+        self.assertEqual(len(client.calls), len(client.max_tokens))
+        planner = [e for e in result.events if e["type"] == "plan"][0]
+        self.assertEqual(len(planner["attempts"]), 1)  # the shared primary model was not drilled
+        verify_ledger(result.ledger_path)
+
+    def test_drill_on_a_timeout_aware_client_routes_every_call_through_complete_with_timeout(self):
+        client = TimedListingClient(run_script())
+        (orchestrator, _), _ = self.build(client=client, inject_failures=True)
+        result = orchestrator.run()
+        self.assertEqual(result.state, "verified_done")
+        self.assertEqual(client.plain, [])  # nothing bypassed the timeout-aware path
+        self.assertEqual({role for _, role, _ in client.timed},
+                         {"planner", "worker_a", "worker_b", "verifier"})
+        for _, _, timeout in client.timed:
+            self.assertTrue(math.isfinite(timeout) and timeout > 0, timeout)
+        # worker_a's two primary calls were injected and never reached the inner client.
+        self.assertEqual([m for m, role, _ in client.timed if role == "worker_a"], [NANO])
+        self.assertEqual(orchestrator.client.injected_total, 2)
+        created = [e for e in result.events if e["type"] == "candidate_created"
+                   and e["worker"] == "worker_a"][0]
+        self.assertEqual([a["outcome"] for a in created["attempts"]], ["model_error", "model_error", "ok"])
+
+    def test_shim_exposes_complete_with_timeout_only_when_the_inner_client_has_it(self):
+        def shim(inner):
+            return live._RoleScopedFaults(
+                inner, live.FaultInjectingClient(inner, faults={SUPER: 1}), "worker_a")
+        self.assertFalse(hasattr(shim(ListingClient(run_script())), "complete_with_timeout"))
+        self.assertTrue(hasattr(shim(TimedListingClient(run_script())), "complete_with_timeout"))
+
+    def test_without_the_flag_nothing_changes(self):
+        (orchestrator, info), client = self.build()
+        self.assertNotIn("drill", info)
+        self.assertIs(orchestrator.client, client)
+        result = orchestrator.run()
+        self.assertEqual([e["type"] for e in result.events][:3],
+                         ["run_started", "run_label", "preflight"])
+        self.assertNotIn("fault_injection", [e["type"] for e in result.events])
+        self.assertEqual(result.events[1]["label"], "development live run; not an official session")
 
     def test_max_tokens_reaches_every_model_call(self):
         for requested in (8192, 2048):
@@ -273,7 +357,8 @@ class PreflightTests(unittest.TestCase):
             return preflight
         with tempfile.TemporaryDirectory() as tmp:
             client, evaluate = ListingClient(run_script()), FakeEvaluate()
-            with mock.patch.object(live, "make_preflight", flaky):
+            with mock.patch.object(live, "make_preflight", flaky), \
+                    mock.patch.object(sessions, "load_session", logs_session):
                 orchestrator, _ = live.build_live_run(
                     session_id="s1", output_dir=Path(tmp) / "run", client=client,
                     evaluate=evaluate, available_ids=LIVE_IDS)
@@ -334,15 +419,126 @@ class RealEvaluateMarginTests(unittest.TestCase):
 
 
 class ImportIsolationTests(unittest.TestCase):
-    def test_importing_live_loads_neither_harness_backend_nor_daytona(self):
+    def test_importing_live_loads_no_harness_backend_repo_task_or_daytona(self):
         code = ("import sys, agent_team.live, agent_team.__main__\n"
-                "bad = [m for m in ('optimizer_core.harness', 'optimizer_core.backend', 'daytona')\n"
+                "bad = [m for m in ('optimizer_core.harness', 'optimizer_core.backend',\n"
+                "                   'optimizer_core.repo_task', 'daytona')\n"
                 "       if m in sys.modules]\n"
                 "print(','.join(bad))")
         done = subprocess.run([sys.executable, "-c", code], cwd=ROOT, capture_output=True, text=True,
                               timeout=60)
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(done.stdout.strip(), "")
+
+
+REPO_TASK_ID = "repo-abc123def456"
+REPO_SUMMARY = "REPO-SUMMARY-MARKER: optimize solve(data) in pkg/mod.py"
+SEED = "feedfacefeedfacefeedfacefeedface"
+
+
+def repo_session(session_id, **kw):
+    return {"schema_version": 1, "session_id": session_id, "seed": SEED,
+            "repo": {"task_id": REPO_TASK_ID, "spec_sha256": "1" * 64, "bundle_sha256": "2" * 64,
+                     "origin_info": {"kind": "git", "commit": "c" * 300, "remote": ["not", "scalar"]},
+                     "include": ["pkg/mod.py"], "n_files": 3, "bundle_bytes": 4096}}
+
+
+def fake_repo_task_module(loaded):
+    module = types.ModuleType("optimizer_core.repo_task")
+
+    class RepoTask:
+        task_id = REPO_TASK_ID
+
+        @classmethod
+        def load(cls, session, root="private/sessions"):
+            loaded.append(session)
+            return cls()
+
+        def public_summary(self):
+            return REPO_SUMMARY
+    module.RepoTask = RepoTask
+    return module
+
+
+class RepoSessionTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.output = Path(self.tmp.name) / "run"
+        self.loaded = []
+        for patcher in (mock.patch.object(live, "make_preflight", no_preflight),
+                        mock.patch.object(sessions, "load_session", repo_session),
+                        mock.patch.dict(sys.modules,
+                                        {"optimizer_core.repo_task": fake_repo_task_module(self.loaded)})):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def build(self, **kw):
+        client = ListingClient(run_script())
+        return live.build_live_run(session_id="dev-session", output_dir=self.output, client=client,
+                                   evaluate=kw.pop("evaluate", FakeEvaluate()),
+                                   available_ids=LIVE_IDS, **kw), client
+
+    def test_build_uses_repo_task_id_summary_and_label(self):
+        (orchestrator, info), _ = self.build()
+        self.assertEqual(orchestrator.task_id, REPO_TASK_ID)
+        self.assertEqual(orchestrator.task_summary, REPO_SUMMARY)
+        self.assertEqual(len(self.loaded), 1)
+        label = orchestrator.annotations[0]
+        self.assertEqual(label, {
+            "type": "run_label", "label": "development live run on user repo; not an official session",
+            "task_id": REPO_TASK_ID, "repo_kind": "git", "repo_commit": "c" * 200,
+            "bundle_sha256": "2" * 64})
+        self.assertEqual(info["task"], {"task_id": REPO_TASK_ID, "kind": "repo",
+                                        "include": ["pkg/mod.py"], "n_files": 3, "bundle_bytes": 4096})
+        self.assertNotIn(SEED, json.dumps(info) + json.dumps(label))
+
+    def test_repo_run_sends_task_id_and_summary_and_labels_the_ledger(self):
+        requests = []
+
+        def evaluate(request):
+            requests.append(request)
+            return FakeEvaluate()(request)
+        (orchestrator, _), client = self.build(evaluate=evaluate)
+        result = orchestrator.run()
+        self.assertEqual(result.state, "verified_done")
+        self.assertTrue(requests)
+        self.assertEqual({r["task_id"] for r in requests}, {REPO_TASK_ID})
+        for _, _, messages in client.calls:
+            self.assertIn(REPO_SUMMARY, json.dumps(messages))
+            self.assertNotIn("logs-parse-v1", json.dumps(messages))
+        events = [r["event"] for r in verify_ledger(orchestrator.ledger_path)]
+        self.assertEqual(events[0]["task_id"], REPO_TASK_ID)
+        self.assertEqual(events[1]["type"], "run_label")
+        self.assertEqual(events[1]["repo_kind"], "git")
+
+    def test_check_live_reports_the_repo_task(self):
+        info = live.check_live("dev-session", available_ids=LIVE_IDS)
+        self.assertEqual(info["task"], {"task_id": REPO_TASK_ID, "kind": "repo",
+                                        "include": ["pkg/mod.py"], "n_files": 3, "bundle_bytes": 4096})
+        self.assertEqual(len(self.loaded), 1)
+
+    def test_logs_session_is_unchanged_and_never_imports_repo_task(self):
+        self.loaded.clear()
+        with mock.patch.object(sessions, "load_session", logs_session), \
+                mock.patch.dict(sys.modules, {"optimizer_core.repo_task": None}):  # import would raise
+            (orchestrator, info), _ = self.build()
+            checked = live.check_live("dev-session", available_ids=LIVE_IDS)
+        self.assertEqual(orchestrator.task_id, "logs-parse-v1")
+        self.assertEqual(orchestrator.task_summary, live.roles.TASK_SUMMARY)
+        self.assertEqual(orchestrator.annotations, [live.RUN_LABEL])
+        self.assertEqual(info["task"]["kind"], "logs")
+        self.assertEqual(checked["task"], {"task_id": "logs-parse-v1", "kind": "logs", "include": None,
+                                           "n_files": None, "bundle_bytes": None})
+        self.assertEqual(self.loaded, [])
+
+    def test_check_cli_prints_the_task(self):
+        out = io.StringIO()
+        with mock.patch.object(live.CrusoeClient, "from_env", return_value=ListingClient(run_script())), \
+                contextlib.redirect_stdout(out):
+            code = main(["run", "--session-id", "s1", "--check"])
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out.getvalue())["task"]["task_id"], REPO_TASK_ID)
 
 
 class CliTests(unittest.TestCase):
@@ -355,7 +551,8 @@ class CliTests(unittest.TestCase):
     def invoke(self, *argv, preflight=None, evaluate=None):
         out, err = io.StringIO(), io.StringIO()
         patches = [mock.patch.object(live.CrusoeClient, "from_env", return_value=self.client),
-                   mock.patch.object(live, "make_preflight", preflight or no_preflight)]
+                   mock.patch.object(live, "make_preflight", preflight or no_preflight),
+                   mock.patch.object(sessions, "load_session", logs_session)]
         if evaluate is not None:
             patches.append(mock.patch.object(live, "real_evaluate", evaluate))
         with contextlib.ExitStack() as stack:
@@ -475,6 +672,31 @@ class CliTests(unittest.TestCase):
         self.assertIn("development live run", summary["note"])
         for key in ("run_id", "rounds", "ledger_path", "ledger_final_sha256", "budget"):
             self.assertIn(key, summary)
+
+    def test_inject_failures_run_reports_the_drill(self):
+        code, out, _ = self.invoke("run", "--session-id", "s1", "--output", str(self.output),
+                                   "--inject-failures", evaluate=FakeEvaluate())
+        self.assertEqual(code, 0)
+        summary = json.loads(out)
+        self.assertEqual(summary["state"], "verified_done")
+        self.assertEqual(summary["drill"], {"role": "worker_a", "model_id": SUPER, "failures": 2,
+                                            "injected_total": 2})
+
+    def test_plain_run_summary_has_no_drill(self):
+        code, out, _ = self.invoke("run", "--session-id", "s1", "--output", str(self.output),
+                                   evaluate=FakeEvaluate())
+        self.assertEqual(code, 0)
+        self.assertNotIn("drill", json.loads(out))
+
+    def test_check_shows_the_drill_plan_and_makes_no_calls(self):
+        code, out, _ = self.invoke("run", "--session-id", "s1", "--output", str(self.output),
+                                   "--check", "--inject-failures")
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out)["drill"], {"role": "worker_a", "model_id": SUPER, "failures": 2})
+        self.assertEqual(self.client.calls, [])
+        self.assertFalse(self.output.exists())
+        code, out, _ = self.invoke("run", "--session-id", "s1", "--output", str(self.output), "--check")
+        self.assertNotIn("drill", json.loads(out))
 
     def test_full_run_not_verified_exits_1(self):
         def unmeasured(request):

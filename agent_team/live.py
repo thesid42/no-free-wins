@@ -1,8 +1,9 @@
 """Live-run wiring: Crusoe models, a priced budget, A's real harness, a session preflight.
 
 Nothing here runs at import time. This is the ONE agent_team module that may reference
-optimizer_core.harness (lazily, inside real_evaluate) or the daytona SDK (an installed-package
-check in the preflight). Importing agent_team.live must not import either.
+optimizer_core.harness (lazily, inside real_evaluate), optimizer_core.repo_task (lazily, inside
+_task_context) or the daytona SDK (an installed-package check in the preflight). Importing
+agent_team.live must not import any of them.
 """
 
 import importlib.metadata
@@ -12,9 +13,11 @@ import re
 
 from optimizer_core import config, sessions
 
+from . import roles
 from .budget import Budget
 from .calls import ModelOrder
 from .crusoe import CrusoeClient, prices_for, resolve_model
+from .faults import FaultInjectingClient, drill_annotation, drill_plan
 from .orchestrator import DEFAULT_MIN_HARNESS_SECONDS, MAX_DEADLINE_SECONDS, Orchestrator
 
 _PLANNER_WORKER = ("nemotron-3-super", "nemotron-3-nano-30b")
@@ -31,6 +34,84 @@ _SESSION_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
 MAX_OFFICIAL_COST_USD = 25.0  # PREP section 4: official run budget is at most min($25, remaining)
 RUN_LABEL = {"type": "run_label", "label": "development live run; not an official session",
              "harness": "optimizer_core real", "models": "crusoe live"}
+
+
+LOGS_TASK_ID = "logs-parse-v1"
+MAX_LABEL_CHARS = 200
+
+
+def _scalar(value):
+    """Annotation values must be scalars: anything else becomes bounded text."""
+    if type(value) in (int, float, bool) and (type(value) is not float or math.isfinite(value)):
+        return value
+    return str(value)[:MAX_LABEL_CHARS]
+
+
+def _task_context(session_id):
+    """(task_id, task_summary, run_label annotation, task info) for a prepared session.
+
+    A session without a repo block is the logs task, exactly as before. For a repo session the
+    summary comes from RepoTask.public_summary(), which reads sealed files and never runs repo
+    code; optimizer_core.repo_task is imported only here, only for repo sessions."""
+    session = sessions.load_session(session_id)
+    repo = session.get("repo")
+    if repo is None:
+        return (LOGS_TASK_ID, roles.TASK_SUMMARY, dict(RUN_LABEL),
+                {"task_id": LOGS_TASK_ID, "kind": "logs", "include": None,
+                 "n_files": None, "bundle_bytes": None})
+    from optimizer_core.repo_task import RepoTask
+    task = RepoTask.load(session)
+    origin = repo.get("origin_info")
+    origin = origin if type(origin) is dict else {}
+    label = {"type": "run_label", "label": "development live run on user repo; not an official session",
+             "task_id": _scalar(task.task_id), "repo_kind": _scalar(origin.get("kind", "")),
+             "repo_commit": _scalar(origin.get("commit", "")),
+             "bundle_sha256": _scalar(repo.get("bundle_sha256", ""))}
+    return (task.task_id, task.public_summary(), label,
+            {"task_id": task.task_id, "kind": "repo", "include": repo.get("include"),
+             "n_files": repo.get("n_files"), "bundle_bytes": repo.get("bundle_bytes")})
+
+
+DRILL_ROLE, DRILL_FAILURES = "worker_a", 2
+DRILL_LABEL_SUFFIX = "; labeled fault drill"
+
+
+class _RoleScopedFaults:
+    """Route only the drilled role's calls through the fault client.
+
+    drill_plan keys faults by model id, and the planner and both workers share a primary model, so
+    an unscoped wrapper would spend the injected failures on whichever role calls first."""
+
+    def __init__(self, inner, faulty, role):
+        self._inner, self._faulty, self._role = inner, faulty, role
+
+    @property
+    def injected_total(self):
+        return self._faulty.injected_total
+
+    def _target(self, role):
+        return self._faulty if role == self._role else self._inner
+
+    def complete(self, model_id, role, messages, max_tokens):
+        return self._target(role).complete(model_id, role, messages, max_tokens)
+
+    def __getattr__(self, name):
+        if name in ("_inner", "_faulty", "_role"):
+            raise AttributeError(name)
+        if name == "complete_with_timeout" and callable(getattr(self._faulty, name, None)):
+            def complete_with_timeout(model_id, role, messages, max_tokens, timeout_seconds):
+                return getattr(self._target(role), name)(model_id, role, messages, max_tokens,
+                                                         timeout_seconds)
+            return complete_with_timeout
+        if name == "list_models":
+            return getattr(self._inner, name)
+        raise AttributeError(name)
+
+
+def _drill_info(orders):
+    plan = drill_plan(orders, DRILL_ROLE, DRILL_FAILURES)
+    (model_id, failures), = plan.items()
+    return {"role": DRILL_ROLE, "model_id": model_id, "failures": failures}
 
 
 def resolve_lineup(available_ids, lineup=LIVE_LINEUP):
@@ -124,21 +205,27 @@ def _plan(available_ids, *, max_cost_usd, deadline_seconds, max_rounds, max_toke
 
 
 def check_live(session_id, *, deadline_seconds=1800, max_rounds=3, max_cost_usd=5.0, max_tokens=8192,
-               client=None, available_ids=None):
+               client=None, available_ids=None, inject_failures=False):
     """Everything a run needs short of running: preflight, free /models listing, lineup, budget."""
     check_session_id(session_id)
     check_deadline(deadline_seconds)
     check_cost(max_cost_usd)
     check_max_tokens(max_tokens)
     make_preflight(session_id)()
+    task = _task_context(session_id)[3]
     if available_ids is None:
         available_ids = (client or CrusoeClient.from_env()).list_models()
-    return _plan(available_ids, max_cost_usd=max_cost_usd, deadline_seconds=deadline_seconds,
-                 max_rounds=max_rounds, max_tokens=max_tokens)[2]
+    orders, _, info = _plan(available_ids, max_cost_usd=max_cost_usd, deadline_seconds=deadline_seconds,
+                            max_rounds=max_rounds, max_tokens=max_tokens)
+    info["task"] = task
+    if inject_failures:
+        info["drill"] = _drill_info(orders)
+    return info
 
 
 def build_live_run(*, session_id, output_dir, deadline_seconds=1800, max_rounds=3, max_cost_usd=5.0,
-                   max_tokens=8192, client=None, evaluate=None, available_ids=None):
+                   max_tokens=8192, client=None, evaluate=None, available_ids=None,
+                   inject_failures=False):
     """Return (Orchestrator, info). The output directory is created only after every check passes."""
     check_session_id(session_id)
     check_deadline(deadline_seconds)
@@ -146,6 +233,7 @@ def build_live_run(*, session_id, output_dir, deadline_seconds=1800, max_rounds=
     check_max_tokens(max_tokens)
     check_output_dir(output_dir)
     make_preflight(session_id)()  # an unprepared session leaves no run directory (the orchestrator repeats it)
+    task_id, task_summary, run_label, task = _task_context(session_id)
     if client is None:
         client = CrusoeClient.from_env()
     if available_ids is None:
@@ -153,11 +241,20 @@ def build_live_run(*, session_id, output_dir, deadline_seconds=1800, max_rounds=
     orders, budget, info = _plan(available_ids, max_cost_usd=max_cost_usd,
                                  deadline_seconds=deadline_seconds, max_rounds=max_rounds,
                                  max_tokens=max_tokens)
+    info["task"] = task
+    annotations = [run_label]
+    if inject_failures:  # labeled drill: worker_a's primary fails twice, the fallback must recover
+        info["drill"] = _drill_info(orders)
+        client = _RoleScopedFaults(client, FaultInjectingClient(client, faults=drill_plan(
+            orders, DRILL_ROLE, DRILL_FAILURES)), DRILL_ROLE)
+        run_label["label"] += DRILL_LABEL_SUFFIX
+        annotations.insert(0, drill_annotation(info["drill"]["model_id"], DRILL_FAILURES))
     ledger = Path(output_dir) / "ledger.jsonl"
     orchestrator = Orchestrator(
         evaluate=evaluate or real_evaluate, client=client, budget=budget, ledger_path=ledger,
         session_id=session_id, orders=orders, deadline_seconds=deadline_seconds,
-        max_rounds=max_rounds, max_tokens=max_tokens, annotations=[dict(RUN_LABEL)],
+        max_rounds=max_rounds, max_tokens=max_tokens, annotations=annotations,
+        task_id=task_id, task_summary=task_summary,
         preflight=make_preflight(session_id),
         min_harness_seconds=dict(LIVE_HARNESS_FLOORS))  # only ever raised above the defaults
     Path(output_dir).mkdir(parents=True, exist_ok=True)

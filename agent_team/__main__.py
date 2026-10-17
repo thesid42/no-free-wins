@@ -149,16 +149,20 @@ def run_live(args):
     """Full live run (real Crusoe models, real harness). Exit 0 only on verified_done."""
     orchestrator, info = live.build_live_run(
         session_id=args.session_id, output_dir=args.output, deadline_seconds=args.deadline,
-        max_rounds=args.max_rounds, max_cost_usd=args.max_cost_usd, max_tokens=args.max_tokens)
+        max_rounds=args.max_rounds, max_cost_usd=args.max_cost_usd, max_tokens=args.max_tokens,
+        inject_failures=args.inject_failures)
     result = orchestrator.run()
     records = verify_ledger(result.ledger_path)
-    return result, {
+    summary = {
         "run_id": result.run_id, "state": result.state, "rounds": result.rounds,
         "ledger_path": result.ledger_path, "ledger_final_sha256": result.ledger_final_sha256,
         "ledger_verified": bool(records) and records[-1]["sha256"] == result.ledger_final_sha256,
         "budget": result.budget,
         "last_forwarded_candidate_id": result.events[-1]["last_forwarded_candidate_id"],
         "models": info["models"], "note": LIVE_NOTE}
+    if "drill" in info:
+        summary["drill"] = {**info["drill"], "injected_total": orchestrator.client.injected_total}
+    return result, summary
 
 
 def main(argv=None):
@@ -184,6 +188,9 @@ def main(argv=None):
     run.add_argument("--max-rounds", type=int, default=3)
     run.add_argument("--max-cost-usd", type=float, default=5.0, help="inference cost cap (max 25)")
     run.add_argument("--max-tokens", type=int, default=8192, help="max tokens per model call")
+    run.add_argument("--inject-failures", action="store_true",
+                     help="labeled drill: worker_a's primary model fails twice before any request, "
+                          "the fallback must recover")
     run.add_argument("--check", action="store_true",
                      help="preflight, list models, resolve lineup and budget; no inference, no sandbox")
     args = parser.parse_args(argv)
@@ -229,7 +236,8 @@ def main_run(args):
         if args.check:
             info = live.check_live(
                 args.session_id, deadline_seconds=args.deadline, max_rounds=args.max_rounds,
-                max_cost_usd=args.max_cost_usd, max_tokens=args.max_tokens)
+                max_cost_usd=args.max_cost_usd, max_tokens=args.max_tokens,
+                inject_failures=args.inject_failures)
             print(json.dumps({"check": "ok", **info}, indent=2))
             return 0
         result, summary = run_live(args)

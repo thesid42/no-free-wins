@@ -75,7 +75,8 @@ class Orchestrator:
                  deadline_seconds, max_rounds=3, screen_bar=3.0, clock=time.monotonic,
                  utcnow=_utcnow, new_id=lambda: uuid.uuid4().hex,
                  task_summary=roles.TASK_SUMMARY, playbook=None, annotations=(),
-                 min_harness_seconds=None, preflight=None, max_tokens=4096):
+                 min_harness_seconds=None, preflight=None, max_tokens=4096,
+                 task_id="logs-parse-v1"):
         if not callable(evaluate):
             raise ValueError("evaluate must be callable")
         if (type(orders) is not dict or set(orders) != ORDER_KEYS or
@@ -83,6 +84,8 @@ class Orchestrator:
             raise ValueError("orders must map planner/worker_a/worker_b/verifier to ModelOrder")
         if type(session_id) is not str or not 1 <= len(session_id) <= 128:
             raise ValueError("session_id must be a 1-128 character string")
+        if type(task_id) is not str or not 1 <= len(task_id) <= 128:
+            raise ValueError("task_id must be a 1-128 character string")
         if not _number(deadline_seconds) or deadline_seconds <= 0:
             raise ValueError("deadline_seconds must be positive and finite")
         if type(max_rounds) is not int or max_rounds < 1:
@@ -102,7 +105,7 @@ class Orchestrator:
         if preflight is not None and not callable(preflight):
             raise ValueError("preflight must be callable")
         self.min_harness_seconds, self._preflight = dict(floors), preflight
-        self.max_tokens = max_tokens
+        self.max_tokens, self.task_id = max_tokens, task_id
         self._evaluate_fn, self.client, self.budget = evaluate, client, budget
         self.ledger_path, self.session_id, self.orders = Path(ledger_path), session_id, orders
         self.deadline_seconds = min(deadline_seconds, MAX_DEADLINE_SECONDS)
@@ -148,7 +151,7 @@ class Orchestrator:
             raise _Terminal("failed_deadline", f"insufficient time for {mode}")
         request = contract.build_request(
             request_id=f"req-{self._new_id()}", session_id=self.session_id, candidate=candidate,
-            mode=mode, remaining_wall_seconds=remaining, verifier=verifier)
+            mode=mode, remaining_wall_seconds=remaining, verifier=verifier, task_id=self.task_id)
         try:
             response = self._evaluate_fn(request)
         except Exception as exc:
@@ -237,14 +240,20 @@ class Orchestrator:
 
     def _screen(self, rnd, new):
         self._heartbeat("screen", rnd)
-        best = None
+        best, evaluated = None, 0
         for candidate in new:
             response = self._harness(candidate, "screen", rnd)
             speedup = response["screen_median_speedup"]
             self._log("screen_result", rnd, screen_median_speedup=speedup,
                       **self._result_fields(candidate, response))
             if response["status"] == "budget_exhausted":
-                raise _Terminal("failed_deadline", "harness budget exhausted in screen")
+                # One candidate ran out of harness budget. Only terminal when the run itself
+                # could not screen another candidate anyway; otherwise it is that candidate's failure.
+                if self._remaining() < self.min_harness_seconds["screen"]:
+                    raise _Terminal("failed_deadline", "harness budget exhausted in screen")
+                self._codes.append({"code": "evaluation_deadline"})
+                continue
+            evaluated += 1
             if response["status"] == "infrastructure_error":
                 raise _Terminal("failed_infrastructure", "screen status infrastructure_error")
             if (response["status"] == "screened" and response["correctness_passed"] and
@@ -252,7 +261,8 @@ class Orchestrator:
                     (best is None or speedup > best[2])):
                 best = (candidate, response, speedup)
         if best is None:
-            self._codes.append({"code": "screen_below_bar"})
+            if evaluated:
+                self._codes.append({"code": "screen_below_bar"})
             return None
         self._best_response = best[1]
         return best[0]
@@ -338,7 +348,8 @@ class Orchestrator:
             raise ValueError("ledger already exists; one run per official ledger")
         self._start = self._clock()
         self._deadline = self._start + self.deadline_seconds
-        self._log("run_started", 0, session_id=self.session_id, deadline_seconds=self.deadline_seconds,
+        self._log("run_started", 0, session_id=self.session_id, task_id=self.task_id,
+                  deadline_seconds=self.deadline_seconds,
                   max_rounds=self.max_rounds, screen_bar=self.screen_bar, models={
                       key: {"primary": order.primary, "fallback": order.fallback}
                       for key, order in self.orders.items()},
