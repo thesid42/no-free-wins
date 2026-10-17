@@ -1,10 +1,5 @@
-/** Future integration boundary only. Nothing implements or calls this interface yet. */
+/** Controller-facing types. The launch types below mirror the bridge's job API (adapter.js). */
 export type Stage = 'analyze' | 'workers' | 'verify' | 'race' | 'zoo' | 'result';
-
-export interface RunRequest {
-  sourceUrl: string;
-  instruction: string;
-}
 
 export interface PipelineEvent {
   runId: string;
@@ -59,11 +54,62 @@ export interface ReplayResult extends VerifiedResult {
   candidateId: string | null;
 }
 
+/** GET /api/health. `launch` is true only when the bridge can start analyses and runs. */
+export interface Health {
+  ok: boolean;
+  mode: 'replay' | 'replay+launch';
+  launch?: boolean;
+}
+
+export type JobKind = 'analyze' | 'answer' | 'approve';
+export type JobStatus = 'queued' | 'running' | 'done' | 'failed' | 'cancelled';
+
+export interface AnalystProposal {
+  target: string; // path:function
+  description: string;
+  hints: string[];
+  risks: string[];
+  generator_source: string;
+  include: unknown;
+  sizes: { timing_size: number; correctness_sizes: number[] };
+}
+
+export interface AnalysisResult {
+  proposal_id: string;
+  status: 'proposal' | 'questions' | 'needs_input' | 'not_feasible';
+  questions: string[];
+  suggestions: string[];
+  reason: string;
+  proposal?: AnalystProposal;
+  target_source_excerpt?: string;
+}
+
+/** GET /api/jobs/:jobId. For `approve`, `result` is the run summary and is never shown as a claim. */
+export interface Job {
+  jobId: string;
+  kind: JobKind;
+  status: JobStatus;
+  phase: string | null;
+  result: AnalysisResult | Record<string, unknown> | null;
+  error: string | null;
+  runId?: string | null;
+  sessionId?: string | null;
+  startedUtc: string | null;
+  endedUtc: string | null;
+}
+
+/** Every launch call sends `confirmSpend: true`; callers must only invoke them after an explicit user confirmation. */
 export interface PipelineAdapter {
-  start(request: RunRequest, signal: AbortSignal): Promise<{ runId: string }>;
-  events(runId: string, signal: AbortSignal): AsyncIterable<PipelineEvent>;
-  chat(runId: string, message: string, signal: AbortSignal): Promise<string>;
-  cancel(runId: string): Promise<void>;
-  result(runId: string): Promise<VerifiedResult>;
-  artifact(artifactId: string, signal: AbortSignal): Promise<Blob>;
+  health(signal?: AbortSignal): Promise<Health>;
+  runs(signal?: AbortSignal): Promise<RunSummary[]>;
+  events(runId: string, signal: AbortSignal, options?: { speed?: 0 | 1 | 8; onEnd?: (state?: string) => void }): AsyncIterable<PipelineEvent>;
+  result(runId: string, signal?: AbortSignal): Promise<ReplayResult>;
+  chat(runId: string, message: string, signal?: AbortSignal): Promise<string>;
+  artifactUrl(artifactId: string): string;
+  analyze(repoUrl: string, prompt: string, signal?: AbortSignal): Promise<{ jobId: string }>;
+  answer(proposalId: string, text: string, signal?: AbortSignal): Promise<{ jobId: string }>;
+  approve(proposalId: string, signal?: AbortSignal): Promise<{ jobId: string; sessionId?: string }>;
+  job(jobId: string, signal?: AbortSignal): Promise<Job>;
+  cancel(jobId: string, signal?: AbortSignal): Promise<unknown>;
+  pollJob(jobId: string, signal: AbortSignal, onUpdate?: (job: Job) => void): Promise<Job | null>;
 }

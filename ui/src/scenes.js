@@ -10,7 +10,20 @@ import { phaseNames, phaseNotes, recordedCode, proof } from './demo-data.js';
  const chip=(text,kind,title)=>'<span class="chip'+(kind?' chip-'+kind:'')+'"'+(title?' title="'+escape(title)+'"':'')+'>'+escape(text)+'</span>';
  function when(iso){const t=Date.parse(iso);return Number.isNaN(t)?String(iso||''):new Date(t).toLocaleString([],{dateStyle:'medium',timeStyle:'short'});}
  function ciText(ci){return Array.isArray(ci)&&num(ci[0])&&num(ci[1])?ci[0].toFixed(2)+'–'+ci[1].toFixed(2)+'×':'';}
+ const clock=ms=>{const t=Math.max(0,Math.floor(ms/1000));return Math.floor(t/60)+':'+String(t%60).padStart(2,'0');};
+ const jobActive=job=>!!job&&(job.status==='queued'||job.status==='running');
+ const list=(items,cls)=>Array.isArray(items)&&items.length?'<ul class="'+(cls||'plain-list')+'">'+items.map(i=>'<li>'+escape(i)+'</li>').join('')+'</ul>':'';
+ export const repoShort=url=>String(url||'').replace(/^https:\/\/github\.com\//,'');
  function waiting(run){return run.status==='streaming'?'Waiting for events…':'Not reached in this run.';}
+ const liveNotes=[
+  'Choose a recorded run to replay, or paste a repo to analyze.',
+  'Planner output from this run’s live ledger: the models and strategies it uses.',
+  'Worker events as they arrive from the live run.',
+  'Correctness screen and independent verifier verdict as they arrive.',
+  'Timing measurement. Numbers are only claimed once the audited result is in.',
+  'The zoo is a separate development defense suite. It is not part of this run.',
+  'The outcome appears only after the run ends and its result is audited.',
+ ];
  const realNotes=[
   'Choose a recorded run to replay. A replay is a recording, not a new run.',
   'Recorded planner output: the models and strategies this run used.',
@@ -24,10 +37,12 @@ import { phaseNames, phaseNotes, recordedCode, proof } from './demo-data.js';
   const renderer='<button type="button" data-renderer aria-label="Toggle pipeline view">'+(view.options.renderer==='ASCII'?'Line graph':'ASCII')+'</button>';
   let controls='<button type="button" data-play class="cursor-interaction">'+(view.playing?'Pause preview':'Play preview')+'</button>'+renderer;
   if(view.run){
-   const live=view.run.status==='streaming';
-   controls='<span class="speed-toggle" role="group" aria-label="Replay speed">'+[['1','1×'],['8','8×'],['instant','Instant']].map(s=>'<button type="button" data-speed="'+s[0]+'" aria-pressed="'+(String(view.speed)===s[0])+'">'+s[1]+'</button>').join('')+'</span><button type="button" data-replay class="cursor-interaction">'+(live?'Stop replay':'Replay run')+'</button>'+renderer;
-  }
-  return '<div class="stage-titlebar"><span class="eyebrow">'+((view.run?'Replay / ':'Preview / ')+phaseNames[phase])+'</span><div class="scene-controls">'+controls+'</div></div>';
+   const streaming=view.run.status==='streaming',isLive=!!view.run.live;
+   const cancel=isLive&&jobActive(view.job)&&view.job.kind==='approve'?'<button type="button" data-act="cancel-job" class="cursor-interaction"'+(view.job.cancelling?' disabled':'')+'>'+(view.job.cancelling?'Cancelling…':'Cancel run')+'</button>':'';
+   controls=cancel+(isLive?'':'<span class="speed-toggle" role="group" aria-label="Replay speed">'+[['1','1×'],['8','8×'],['instant','Instant']].map(s=>'<button type="button" data-speed="'+s[0]+'" aria-pressed="'+(String(view.speed)===s[0])+'">'+s[1]+'</button>').join('')+'</span>')+'<button type="button" data-replay class="cursor-interaction">'+(streaming?(isLive?'Stop following':'Stop replay'):'Replay run')+'</button>'+renderer;
+  } else if(view.analysis) controls='';
+  const lead=view.run?(view.run.live?'Live run / ':'Replay / '):view.analysis?'Analyst / ':'Preview / ';
+  return '<div class="stage-titlebar"><span class="eyebrow">'+(lead+phaseNames[phase])+'</span><div class="scene-controls">'+controls+'</div></div>';
  }
  function runItem(view,r){
   const official=r.kind==='official',featured=official&&r.verified===true;
@@ -37,10 +52,49 @@ import { phaseNames, phaseNotes, recordedCode, proof } from './demo-data.js';
  }
  function startScene(view){
   if(view.api==='up'){
+   const launch=view.launch===true;
    const runs=view.runsError?'<p class="run-empty" role="status">'+escape(view.runsError)+'</p>':view.runs.length?'<ul class="run-list" aria-label="Recorded runs">'+view.runs.map(r=>runItem(view,r)).join('')+'</ul>':'<p class="run-empty">No recorded runs found.</p>';
+   if(launch) return '<div class="input-scene"><div class="big-symbol">nfw↗</div><h2>Optimize a GitHub repo.</h2><p class="stage-sub">Paste a public repo link below and say what should be faster. An analyst agent reads the repo and proposes a contract. Nothing runs until you approve it, and repo code only ever runs in the Daytona sandbox.</p><h3 class="run-heading">Recorded runs</h3>'+runs+'<button type="button" class="nfw-secondary" data-example>Play example · scripted demo ↗</button><div class="supported">Launch enabled · analysis uses Crusoe credits · replays are recordings, not new runs</div></div>';
    return '<div class="input-scene"><div class="big-symbol">nfw↗</div><h2>Replay a recorded run.</h2><p class="stage-sub">Pick a run recorded on this machine and watch it move through the pipeline. A replay is a recording, not a new run.</p><h3 class="run-heading">Recorded runs</h3>'+runs+'<button type="button" class="nfw-secondary" data-example>Play example · scripted demo ↗</button><div class="supported">Replay only · links are not fetched and nothing is launched</div></div>';
   }
   return '<div class="input-scene"><div class="big-symbol">nfw↗</div><h2>Give your code a fair race.</h2><p class="stage-sub">Paste a link. Tell me what needs to change.<br>Preview the pipeline and a recorded example result.</p><button type="button" class="nfw-secondary" data-example>Play example ↗</button><div class="supported">UI skeleton · code links are only stored in this page’s memory</div></div>';
+ }
+ function contractSummary(r){
+  const p=r&&r.proposal&&typeof r.proposal==='object'?r.proposal:null;
+  if(!p) return '';
+  const sz=p.sizes&&typeof p.sizes==='object'?p.sizes:{};
+  const sizes=(num(sz.timing_size)?'timing '+sz.timing_size:'')+(Array.isArray(sz.correctness_sizes)&&sz.correctness_sizes.length?(num(sz.timing_size)?' · ':'')+'correctness '+sz.correctness_sizes.filter(num).join(', '):'');
+  return '<div class="file-focus"><div class="nfw-mono">'+escape(p.target||'target not given')+'<small>Proposed target</small></div><span>Awaiting your decision</span></div>'+(p.description?'<p class="stage-sub">'+escape(p.description)+'</p>':'')+(Array.isArray(p.hints)&&p.hints.length?'<h3 class="mini-heading">Planned optimizations</h3>'+list(p.hints):'')+(Array.isArray(p.risks)&&p.risks.length?'<h3 class="mini-heading">Risks</h3>'+list(p.risks):'')+(sizes?'<p class="nfw-muted">Sizes · '+escape(sizes)+'</p>':'');
+ }
+ function analystScene(view){
+  const a=view.analysis,job=view.job,repo=escape(repoShort(a.repoUrl));
+  const head='<h2>Reading between the lines.</h2>';
+  if(jobActive(job)){
+   const approve=job.kind==='approve';
+   const label=approve?'Preparing sandbox: generating hidden cases and recording the original function’s outputs':job.kind==='answer'?'The analyst is revising its proposal with your answer':'The analyst agent is reading the repo';
+   return head+'<p class="stage-sub">'+(approve?'Approved. Hidden cases are generated and the original function’s outputs are recorded inside the Daytona sandbox. This usually takes about 2 minutes.':'The analyst reads '+repo+' and your prompt. Nothing from the repo runs on your machine.')+'</p><div class="job-status" role="status"><span class="status-dot"></span><span>'+escape(label)+'<span class="flow-dots"> ···</span></span><span class="nfw-mono" aria-hidden="true" data-elapsed>'+clock(Date.now()-job.startedAt)+'</span></div>'+(job.phase?'<p class="nfw-muted">Phase · '+escape(String(job.phase).slice(0,120))+'</p>':'')+'<div class="result-actions"><button type="button" class="nfw-secondary" data-act="cancel-job"'+(job.cancelling?' disabled':'')+'>'+(job.cancelling?'Cancelling…':'Cancel')+'</button></div><div class="scene-footer">Live job · uses Crusoe credits within the configured cap</div>';
+  }
+  const last=a.last;
+  if(last&&last.type==='failed') return head+'<div class="success-heading fail-heading"><span class="success-check">✕</span>'+(last.kind==='approve'?'Prepare failed':'Analysis failed')+'</div><div class="end-state nfw-mono">'+escape(last.error||'The job failed.')+'</div><p class="stage-sub">Nothing was claimed. Use the chat to retry'+(last.kind==='approve'?' or ask the analyst to fix it':'')+'.</p>';
+  if(last&&last.type==='cancelled') return head+'<p class="stage-sub">The job was cancelled. Nothing was claimed.</p>';
+  const r=last&&last.type==='result'?last.result:null;
+  if(!r) return head+'<p class="stage-sub">Waiting for the analyst.</p>';
+  if(r.status==='proposal') return head+'<p class="stage-sub">The analyst proposed a contract for '+repo+'. Approve it or suggest changes in the chat.</p>'+contractSummary(r);
+  if(r.status==='not_feasible') return head+'<div class="success-heading fail-heading"><span class="success-check">✕</span>Not feasible as asked</div><p class="stage-sub">'+escape(r.reason||'The analyst did not give a reason.')+'</p>'+(Array.isArray(r.suggestions)&&r.suggestions.length?'<h3 class="mini-heading">Possible optimizations / alternatives</h3>'+list(r.suggestions):'');
+  return head+'<p class="stage-sub">'+escape(r.reason||'The analyst needs more information. Answer in the chat.')+'</p>'+(Array.isArray(r.questions)&&r.questions.length?'<h3 class="mini-heading">Questions</h3><ol class="plain-list">'+r.questions.map(q=>'<li>'+escape(q)+'</li>').join('')+'</ol>':'');
+ }
+ export function analysisNote(view){
+  const a=view.analysis,job=view.job;
+  if(jobActive(job)) return job.kind==='approve'?'Approved. Preparing the sandbox before the live run starts.':'The analyst agent is working. You can answer once it responds.';
+  const last=a.last;
+  if(!last) return 'Waiting for the analyst.';
+  if(last.type==='failed') return 'The job failed. Details are in the chat.';
+  if(last.type==='cancelled') return 'The job was cancelled.';
+  const s=last.result&&last.result.status;
+  return s==='proposal'?'The analyst proposed a contract. Nothing runs until you approve.':s==='not_feasible'?'The analyst says this is not feasible as asked. See the alternatives.':'The analyst has questions. Your next message is sent as the answer.';
+ }
+ function notReached(view){
+  return '<h2>Not reached yet.</h2><p class="stage-sub">No run has started for '+escape(repoShort(view.analysis.repoUrl))+'. These stages show real events once you approve a proposal and the live run begins.</p><div class="scene-footer">Nothing is shown here until the run produces it</div>';
  }
  function analyzeReal(view){
   const run=view.run,d=run.data,roles=d.models&&typeof d.models==='object'?Object.keys(d.models):[];
@@ -49,7 +103,7 @@ import { phaseNames, phaseNotes, recordedCode, proof } from './demo-data.js';
   const limits=(num(d.maxRounds)||num(d.deadline))?'<div class="check-line"><span>Limits</span><span>'+(num(d.maxRounds)?d.maxRounds+' rounds':'')+(num(d.maxRounds)&&num(d.deadline)?' · ':'')+(num(d.deadline)?d.deadline+' s deadline':'')+'</span></div>':'';
   const graph='<div class="file-focus"><div class="nfw-mono">'+escape(d.sessionId||run.meta.sessionId||run.id)+'<small>Session'+(run.meta.taskId?' · task '+escape(run.meta.taskId):'')+'</small></div><span>Recorded run</span></div>';
   const text=ascii(['session  '+(d.sessionId||run.meta.sessionId||run.id),'task     '+(run.meta.taskId||'—'),'',...(d.strategyIds||[]).map((id,i)=>'strategy '+(i+1)+'  '+id)],REAL_ASCII);
-  return '<h2>Reading between the lines.</h2><p class="stage-sub">Recorded planner output. No source was fetched for this replay.</p>'+(view.options.renderer==='ASCII'?text:graph)+'<div class="check-list">'+(models?'<h3>Models · primary → fallback</h3>'+models:'')+(strategies?'<h3>Strategies planned</h3>'+strategies:'')+limits+(models||strategies?'':'<div class="check-line"><span>'+waiting(run)+'</span></div>')+'</div>';
+  return '<h2>Reading between the lines.</h2><p class="stage-sub">'+(run.live?'Planner output from this run’s live ledger.':'Recorded planner output. No source was fetched for this replay.')+'</p>'+(view.options.renderer==='ASCII'?text:graph)+'<div class="check-list">'+(models?'<h3>Models · primary → fallback</h3>'+models:'')+(strategies?'<h3>Strategies planned</h3>'+strategies:'')+limits+(models||strategies?'':'<div class="check-line"><span>'+waiting(run)+'</span></div>')+'</div>';
  }
 
  function workerScene(view){
@@ -115,15 +169,15 @@ import { phaseNames, phaseNotes, recordedCode, proof } from './demo-data.js';
   const run=view.run,r=run.result,t=run.terminal;
   const label=(r&&r.label)||run.data.label||run.meta.label;
   const labelLine=label?'<p class="run-label">'+escape(label)+'</p>':'';
-  const foot='<div class="scene-footer">Recorded run '+escape(run.id)+' · a replay is not a new run or a new benchmark</div>';
-  if(!r&&run.resultState!=='error'&&!t) return '<h2>Result</h2>'+labelLine+'<p class="run-empty">'+(run.status==='streaming'||run.resultState==='loading'?'Waiting for the run to finish…':'No result was recorded for this replay.')+'</p>'+foot;
+  const foot='<div class="scene-footer">'+(run.live?'Run '+escape(run.id)+' · launched from this page · claims come only from the audited result':'Recorded run '+escape(run.id)+' · a replay is not a new run or a new benchmark')+'</div>';
+  if(!r&&run.resultState!=='error'&&!t) return '<h2>Result</h2>'+labelLine+'<p class="run-empty">'+(run.status==='streaming'||run.resultState==='loading'?'Waiting for the run to finish…':run.live?'No result was recorded for this run.':'No result was recorded for this replay.')+'</p>'+foot;
   if(!(r&&r.accepted===true)&&(run.status==='streaming'||run.resultState==='loading')) return '<h2>Result</h2>'+labelLine+'<p class="run-empty">Waiting for the run to finish…</p>'+foot;
   if(r&&r.accepted===true){
    const audited=r.receiptAuditValid===true;
    const links=[['optimizedArtifactId','↓ Optimized code','nfw-primary'],['originalArtifactId','↓ Original code','nfw-secondary'],['proofArtifactId','↓ Proof','nfw-secondary']].map(x=>{try{return '<a class="nfw-link '+x[2]+'" href="'+escape(view.artifactUrl(r[x[0]]))+'" download>'+x[1]+'</a>';}catch{return '';}}).join('');
    const checks=(num(r.hiddenCases)?'<span>'+r.hiddenCases.toLocaleString()+' hidden cases</span>':'')+(num(r.timingPairs)?'<span>'+r.timingPairs+' timing pairs</span>':'')+(r.sandboxDeleted===true?'<span>sandbox deleted</span>':'')+(audited?'<span>receipt audited ✓</span>':'');
    const ci=ciText(r.confidenceInterval95);
-   return '<div class="success-heading"><span class="success-check">'+(audited?'✓':'!')+'</span>'+(audited?'Recorded verified result':'Accepted · receipt audit not confirmed')+'</div>'+labelLine+'<div class="speed">'+fx(r.medianSpeedup)+'</div><div class="speed-label">median speedup, with matching outputs</div>'+(ci?'<div class="interval">95% confidence interval <strong>'+ci+'</strong></div>':'')+'<div class="result-checks">'+checks+'</div>'+(audited?'':'<p class="run-warn" role="note">The receipt audit did not validate for this run, so treat this result as unverified.</p>')+(r.ledgerVerified===false?'<p class="run-warn" role="note">The run ledger hash chain did not verify.</p>':'')+'<div class="result-actions">'+links+'</div><details><summary class="cursor-interaction">View proof'+(audited?' · receipt audited ✓':'')+'</summary><div class="proof-data">'+[['Receipt SHA-256',r.receiptSha256],['Source SHA-256',r.sourceSha256],['Candidate',r.candidateId],['Session',r.sessionId],['Task',r.taskId],['Ledger final SHA-256',r.ledgerFinalSha256]].filter(x=>x[1]).map(x=>escape(x[0])+':<br>'+escape(x[1])).join('<br><br>')+(r.ledgerVerified===true?'<br><br>Ledger hash chain verified ✓':'')+'</div></details>'+foot;
+   return '<div class="success-heading"><span class="success-check">'+(audited?'✓':'!')+'</span>'+(audited?(run.live?'Verified result':'Recorded verified result'):'Accepted · receipt audit not confirmed')+'</div>'+labelLine+'<div class="speed">'+fx(r.medianSpeedup)+'</div><div class="speed-label">median speedup, with matching outputs</div>'+(ci?'<div class="interval">95% confidence interval <strong>'+ci+'</strong></div>':'')+'<div class="result-checks">'+checks+'</div>'+(audited?'':'<p class="run-warn" role="note">The receipt audit did not validate for this run, so treat this result as unverified.</p>')+(r.ledgerVerified===false?'<p class="run-warn" role="note">The run ledger hash chain did not verify.</p>':'')+'<div class="result-actions">'+links+'</div><details><summary class="cursor-interaction">View proof'+(audited?' · receipt audited ✓':'')+'</summary><div class="proof-data">'+[['Receipt SHA-256',r.receiptSha256],['Source SHA-256',r.sourceSha256],['Candidate',r.candidateId],['Session',r.sessionId],['Task',r.taskId],['Ledger final SHA-256',r.ledgerFinalSha256]].filter(x=>x[1]).map(x=>escape(x[0])+':<br>'+escape(x[1])).join('<br><br>')+(r.ledgerVerified===true?'<br><br>Ledger hash chain verified ✓':'')+'</div></details>'+foot;
   }
   const state=(r&&r.state)||(t&&t.state)||run.endState||run.meta.state,reason=t&&t.reason;
   const broken=!!r&&(r.state==='ledger_invalid'||r.ledgerVerified===false);
@@ -131,9 +185,20 @@ import { phaseNames, phaseNotes, recordedCode, proof } from './demo-data.js';
  }
  export function statusText(view){
   const run=view.run;
-  if(!run&&view.api==='up'&&!view.playing&&view.phase===0) return 'Connected · choose a recorded run to replay';
+  if(!run&&view.analysis){
+   const job=view.job;
+   if(jobActive(job)) return (job.kind==='approve'?'Preparing sandbox':'Analyst agent working')+' · '+repoShort(view.analysis.repoUrl);
+   return 'Analyst · '+repoShort(view.analysis.repoUrl)+' · '+(view.analysis.last?analysisNote(view):'waiting');
+  }
+  if(!run&&view.api==='up'&&!view.playing&&view.phase===0) return view.launch===true?'Connected · launch enabled · paste a repo below or choose a recorded run':'Connected · choose a recorded run to replay';
   if(!run) return view.playing?'Playing local demo · '+phaseNames[view.phase]:'Local demo · '+phaseNames[view.phase];
   const speed=view.speed==='instant'?'instant':view.speed+'× speed';
+  if(run.live){
+   if(run.status==='streaming') return 'Live run '+run.id+' · following the run ledger';
+   if(run.status==='stopped') return 'Stopped following live run '+run.id;
+   if(run.status==='error') return 'Live stream interrupted · '+run.id+(run.error?' · '+run.error:'');
+   return 'Run finished · '+run.id+' · launched from this page';
+  }
   if(run.status==='streaming') return 'Replaying '+run.id+' · '+speed;
   if(run.status==='stopped') return 'Replay stopped · '+run.id+' · recorded run, not a new run';
   if(run.status==='error') return 'Replay interrupted · '+run.id+(run.error?' · '+run.error:'');
@@ -147,18 +212,20 @@ import { phaseNames, phaseNotes, recordedCode, proof } from './demo-data.js';
  }
  export function render(view,animate){
   const app=view.element,phase=view.phase,run=view.run;
-  const active=document.activeElement,focusKey=active&&app.contains(active)?['data-phase','data-speed','data-replay','data-play','data-renderer','data-run'].map(a=>active.hasAttribute(a)?'['+a+'="'+CSS.escape(active.getAttribute(a))+'"]':'').find(Boolean):'';
+  const active=document.activeElement,focusKey=active&&app.contains(active)?['data-phase','data-speed','data-replay','data-play','data-renderer','data-run','data-act'].map(a=>active.hasAttribute(a)?'['+a+'="'+CSS.escape(active.getAttribute(a))+'"]':'').find(Boolean):'';
   app.dataset.phase=String(phase);
   const nav=app.querySelector('.sequence');
   nav.innerHTML=phaseNames.map((label,i)=>navButton(view,i,label)).join('');
   let content='';
   if(phase===0) content=startScene(view);
-  if(phase===1) content=run?analyzeReal(view):'<h2>Reading between the lines.</h2><p class="stage-sub">Example source only. Your pasted link has not been fetched.</p><div class="file-focus"><div class="nfw-mono">↗ parser.py<small>Python · solve(lines)</small></div><span>Example source</span></div>'+(view.options.renderer==='ASCII'?ascii(['[code link] → [source] → [contract]','','hot path: repeated scans per user','preserve: exact input + output']):'<div class="scan-lines" aria-hidden="true"><span></span><span></span><span></span></div>')+'<div class="check-list"><div class="check-line"><span>Input and output contract</span><span>Understood ✓</span></div><div class="check-line"><span>Goal</span><span>≥3× faster</span></div></div>';
-  if(phase===2) content=workerScene(view);
-  if(phase===3) content=verifyScene(view);
-  if(phase===4) content=raceScene(view);
-  if(phase===5) content=zooScene(view);
-  if(phase===6) content=resultScene(view);
+  if(phase===1) content=run?analyzeReal(view):view.analysis?analystScene(view):'<h2>Reading between the lines.</h2><p class="stage-sub">Example source only. Your pasted link has not been fetched.</p><div class="file-focus"><div class="nfw-mono">↗ parser.py<small>Python · solve(lines)</small></div><span>Example source</span></div>'+(view.options.renderer==='ASCII'?ascii(['[code link] → [source] → [contract]','','hot path: repeated scans per user','preserve: exact input + output']):'<div class="scan-lines" aria-hidden="true"><span></span><span></span><span></span></div>')+'<div class="check-list"><div class="check-line"><span>Input and output contract</span><span>Understood ✓</span></div><div class="check-line"><span>Goal</span><span>≥3× faster</span></div></div>';
+  const unreached=!run&&!!view.analysis&&phase>=2;
+  if(unreached) content=notReached(view);
+  else if(phase===2) content=workerScene(view);
+  else if(phase===3) content=verifyScene(view);
+  else if(phase===4) content=raceScene(view);
+  else if(phase===5) content=zooScene(view);
+  else if(phase===6) content=resultScene(view);
   const surface=app.querySelector('.stage-surface');
   surface.innerHTML=top(phase,view)+content;
   surface.classList.remove('nfw-motion');
@@ -168,13 +235,8 @@ import { phaseNames, phaseNotes, recordedCode, proof } from './demo-data.js';
   if(focusKey){const next=app.querySelector(focusKey);if(next)next.focus({preventScroll:true});}
   app.querySelector('.preview-status').textContent=statusText(view);
   const status=app.querySelector('.history .agent .chat-body');
-  status.textContent=run?realNotes[phase]:phaseNotes[phase];
+  status.textContent=run?(run.live?liveNotes[phase]:realNotes[phase]):view.analysis?analysisNote(view):phaseNotes[phase];
   app.querySelector('.history').hidden=phase===0;
-  app.querySelector('.suggestions').hidden=phase===0;
-  app.querySelector('.source-tray').hidden=!(view.sourceOpen||phase===0);
-  const input=app.querySelector('textarea');
-  input.placeholder=phase===0?(view.api==='up'?'Ask about a run once you’ve chosen one…':'Tell me what you want changed…'):'Ask about this run, or tell me what’s next…';
-  const send=app.querySelector('.send');
-  send.textContent=phase===0?(view.api==='up'?'Use link ↗':'Preview flow ↗'):'↑';
-  send.setAttribute('aria-label',phase===0?(view.api==='up'?'Use code link (not enabled yet)':'Start local preview'):'Send message');
+  app.querySelector('.suggestions').hidden=phase===0||(!run&&!!view.analysis);
+  app.querySelector('.source-tray').hidden=!(view.sourceOpen||phase===0)||(!run&&!!view.analysis);
  }

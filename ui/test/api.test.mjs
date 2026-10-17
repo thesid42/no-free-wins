@@ -44,7 +44,7 @@ describe('health and run listing', () => {
   test('health', async () => {
     const r = await raw(api.port, '/api/health');
     assert.equal(r.status, 200);
-    assert.deepEqual(r.json, { ok: true, mode: 'replay', runsRoot: 'artifacts/runs' });
+    assert.deepEqual(r.json, { ok: true, mode: 'replay+launch', launch: true, runsRoot: 'artifacts/runs' });
   });
 
   test('runs: kinds, states, newest first', async () => {

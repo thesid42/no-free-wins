@@ -19,7 +19,7 @@ Status as of October 17, 2026:
 | Workload | `logs-parse-v1`: strict parsing and aggregation with a trusted oracle |
 | Acceptance | Correct outputs, 30 timing pairs, at least 3x median speedup and a 95% bootstrap CI lower bound of at least 3x |
 | Evidence | Raw execution proofs, artifact hashes, receipts, audit, and a hash-chain ledger |
-| Local tests | 411 Python tests and 84 UI bridge tests passing (repo input, analyst, fault drill, replay API) |
+| Local tests | 411 Python tests and 117 UI bridge tests passing (repo input, analyst, fault drill, replay and launch API) |
 | B: agent orchestration | Event-built `agent_team/` state machine, retries/fallback, budgets, official ledger, and live `run` CLI |
 | Live Crusoe agents and independent model verifier | Validated with real Nemotron workers, GLM verifier, and measured Daytona acceptance |
 | Repo input | Event-built development feature: `repo-dev-1` on `examples/textstats` reached `verified_done` at 8.03× (95% CI 7.76–8.21×, receipt audited); not part of the official result |
@@ -112,7 +112,7 @@ npm run dev
 
 Open `http://127.0.0.1:5173`. Run `npm run check` for JavaScript syntax checks.
 
-**Replay integration (event-built, development).** When `npm run dev` is started from this repository, `ui/server.mjs` also serves a local-only API (127.0.0.1, same-origin, read-only) over this machine's `artifacts/runs/` ledgers: a recorded-runs list, ledger events streamed into the seven scenes, results taken from audited receipts, downloads of the optimized code, original code and proof, and chat answers templated from the run's real data (no model calls). A replay is a recording, not a new run. Launching runs, analyst questions and approval from the UI are not connected yet; the link box only explains this. Without the API the page falls back to the original scripted demo. `npm test` runs the bridge tests.
+**Replay integration (event-built, development).** When `npm run dev` is started from this repository, `ui/server.mjs` also serves a local-only API (127.0.0.1, same-origin, read-only) over this machine's `artifacts/runs/` ledgers: a recorded-runs list, ledger events streamed into the seven scenes, results taken from audited receipts, downloads of the optimized code, original code and proof, and chat answers templated from the run's real data (no model calls). A replay is a recording, not a new run. Launching is connected too (development): paste a public GitHub repo URL and a prompt; after an in-chat spend confirmation the bridge runs `agent_team analyze`, shows the analyst's proposal, questions or not-feasible answer with suggestions in the chat, sends your replies as answers, and on **Approve & run** runs `approve --run` and live-tails the run into the scenes. One job at a time, fixed argv with no shell, same-origin and Host checks, and cancel sends SIGINT first so the Python side can clean up. Set `NFW_UI_LAUNCH=0` for replay only. Without the API the page falls back to the original scripted demo. `npm test` runs the bridge tests.
 
 ## Optimize your own repo (development)
 

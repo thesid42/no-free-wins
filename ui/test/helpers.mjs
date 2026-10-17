@@ -100,8 +100,11 @@ export function addRun(runsRoot, runId, events, { candidate = CANDIDATE_SOURCE }
   }
 }
 
+/** Default runner for tests: launching must never reach a real Python CLI (Crusoe, Daytona). */
+const refuseRunner = () => { throw Object.assign(new Error('test attempted to spawn a real process'), { code: 'EREFUSED' }); };
+
 export async function startApi(runsRoot, options = {}) {
-  const api = createApi({ repoRoot, runsRoot, ...options });
+  const api = createApi({ repoRoot, runsRoot, runner: refuseRunner, ...options });
   const server = createServer(async (req, res) => {
     if (!(await api.handle(req, res))) res.writeHead(404).end('static');
   });
