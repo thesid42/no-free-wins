@@ -13,7 +13,11 @@ class ModelReply:
 
 
 class ModelError(RuntimeError):
-    pass
+    def __init__(self, message, *, tokens=None):
+        super().__init__(message)
+        if tokens is not None and (type(tokens) is not int or tokens < 0):
+            raise ValueError("error usage must be a non-negative integer or unknown")
+        self.tokens = tokens
 
 
 class MalformedOutput(ValueError):

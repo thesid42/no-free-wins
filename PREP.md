@@ -50,14 +50,14 @@ Use a fresh directory for a synthetic demo; it never claims real acceptance. Eva
 
 Artifacts and private seeds are Git-ignored. Raw timing proofs, responses, receipts and a host hash-chain ledger go under artifacts/. The cleanup command only touches sandbox IDs/names recorded by this project. Do not run cleanup against an active evaluation.
 
-## 2. Ownership — independent today, merge at the venue tomorrow
+## 2. Ownership — A/B handoff and integration
 
 | Owner | Environment | Work |
 |---|---|---|
 | A: Sid | Windows, native Python, Daytona Linux | Deterministic harness, protected supervisor, output schema/oracle/corpus, timing, independent zoo labels, receipts/audit |
 | B: teammate | Mac, native Python, own repo | Orchestration, contract/planner/workers/verifier, distinct strategies, deadlines/budgets/recovery, shared playbook/regression flow |
 
-A owns optimizer_core/ and tests for the harness/backend. B owns a separate agent_team/ package and tests/test_orchestration.py. No cross-imports today. B implements a fake harness with the JSON contract below. There is no need for a web service or a shared cloud filesystem. Tomorrow at 10:45AM, place the two packages alongside one another, preserve both pre-event baselines, select one controller and official ledger writer, and replace B's fake with A's evaluate_candidate function.
+A owns optimizer_core/ and tests for the harness/backend. B owns agent_team/ and orchestration tests. The packages were prepared independently and are now alongside one another in this repository. B retains an injected fake harness for offline tests; agent_team/live.py connects A's real evaluate_candidate function for live runs. One controller owns the official ledger. No web service, shared cloud filesystem, or WSL is required. The standalone assignment below records the preparation handoff.
 
 ### B's standalone Friday assignment
 
@@ -216,7 +216,7 @@ One-minute video at 3:30: goal 6s; labeled rejection/regression 12s; two workers
 
 ## 8. Status, primary sources and event changes
 
-Implemented A: .env loader, strict JSON/canonical comparison, fixed acceptance math, seed commitments, workload/oracle/generator/zoo fixtures, real Daytona SDK adapter, protected Linux supervisor, lifecycle registry/cleanup, B-compatible harness, raw-proof receipts and audit, CLI. Candidate code never executes on the controller. B's orchestration/agent code is not implemented here.
+Implemented A: .env loader, strict JSON/canonical comparison, fixed acceptance math, seed commitments, workload/oracle/generator/zoo fixtures, real Daytona SDK adapter, protected Linux supervisor, lifecycle registry/cleanup, B-compatible harness, raw-proof receipts and audit, CLI. Candidate code never executes on the controller. B's orchestration, Crusoe adapter and live run wiring are implemented in agent_team/; current event validation is recorded below.
 
 Live checks have confirmed candidate isolation/timer resistance/timeout and machine deletion. A three-pair 50k-line reference calibration was about 2.99x; it is screening evidence, not acceptance. Full protocol status and final test results are recorded below after validation. A's environment contains a configured key; its value is never included in documentation, output or manifests.
 
@@ -238,7 +238,7 @@ Validation completed October 16:
 - Receipt SHA-256: 2ead31665fac3297ba5242113d1de75c4c14a2f82848178796701fdc928228b9
 - Zoo report: artifacts/zoo/c72e9f473088438891a435efe7139ac8/report.json
 
-B's live agents, independent model verifier, full autonomous team run and any Version N+1 study remain B/integration work.
+The original preparation results above did not evaluate live agents or a model verifier. Current event integration and remaining work are recorded below; the playbook/regression implementation and any Version N+1 study remain pending.
 
 Repository setup on October 17: preserved the existing preparation files in baseline commit b5e1933, then named the project No Free Wins in PREP.md and pyproject.toml. The commit records when the files entered Git; the prior-work attribution is based on the disclosed preparation history. pre_event_manifest.json remains the original preparation inventory; its PREP.md and pyproject.toml hashes describe the baseline before these naming edits.
 
@@ -253,4 +253,13 @@ Event feature changes after Saturday's start (October 17):
 - agent_team/crusoe.py (event-built, B): stdlib Crusoe ModelClient for https://api.inference.crusoecloud.com/v1 — one request per attempt (retry/fallback stay in calls.py), every transport/HTTP/JSON/empty-content failure mapped to ModelError, redirects refused so the key cannot follow a 3xx, hard wall-clock and 8 MiB body bound, key redacted from errors; conservative per-model pricing (output rate per 1k total tokens) and case-insensitive model-ID resolution against the live listing; `python -m agent_team models [--resolve NAME]`. Tests: tests/test_crusoe.py (fake transport plus loopback-only servers).
 - Live listing on October 17 showed 13 models. Chosen live lineup (IDs from /v1/models): planner and workers nvidia/NVIDIA-Nemotron-3-Super-120B-A12B with fallback nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B; verifier zai-org/GLM-5.3-Flash with fallback deepseek-ai/Deepseek-V4-Flash. Conservative output-rate prices per 1M tokens: $2.40, $0.20, $0.50, $0.28.
 - agent_team/live.py and `python -m agent_team run --session-id S [--check]` (event-built, B): CrusoeClient with the recorded lineup, priced Budget (cost <= $25, default $5), A's real evaluate_candidate imported lazily only here, preflight (prepared session, Daytona config, SDK) before any model call, deadline <= 1,800 s, 120 s sandbox-setup margin with live harness floors raised to 360/960 s, and a run_label annotation marking development live runs. Role parsers tolerate fences, think blocks and extra keys but fail closed on ambiguous or hidden verdicts and cap reply size. Tests: tests/test_live.py.
-- Not yet done: live dry run results, freeze, official session.
+- Official freeze and official session remain pending. Local development run evidence follows.
+
+- Integration hardening on October 17: reject late model replies and harness returns before they can become a verdict or verified_done; pass remaining time into live model transport and bound response reads by that deadline. Record provider usage even for unusable replies; retain the reservation when failed-request usage is unknown, and stop on reported token or cost overruns. Seven regression tests added; 239 tests pass, dependencies pass pip check.
+- Local authenticated Crusoe preflight passed with the recorded model lineup. Development session dev-live-a-20261017-1 was prepared before agent calls, with 100,000-line workloads, at most two rounds, a 1,800-second deadline and a $1 inference cap. Daytona costs are separate. Completed results are recorded below.
+- Scope decision: dedicated honeytraps are excluded. Keep the existing separate cheating zoo. Playbook/regression classes are still placeholders. The current 30-minute live-run cap does not support the optional 150-active-minute claim; no such duration result is claimed.
+- First live development result (dev-live-a-20261017-1): rounds_exhausted after the planned two rounds, four candidates, five successful inference calls, 11,961 tokens, estimated conservative inference cost $0.0287064. Three candidates failed correctness; worker_b-r1 passed correctness and screened at 2.8103x, below the unchanged 3x screen bar. No verifier/acceptance call was reached. All four evaluation machines were confirmed deleted. Official message-ledger verification passed; final digest ed31887b43369a50a97e11ad36c4db593cb8ba333cfae0b74d166538387865dc. Local summary: artifacts/runs/dev-live-a-20261017-1/summary.json.
+- Before a new development session, clarified the PUBLIC task prompt: full-string matching, no whitespace normalization, ASCII-only character classes, public invalid-line examples, and the 3x goal. No generated candidate was edited manually. Hidden-case generator, workload scale, oracle, thresholds, and timing protocol were unchanged. Fresh session dev-live-a-20261017-2 had at most one round, a $1 inference cap, and a 1,800-second deadline.
+- Second live development result (dev-live-a-20261017-2, run-4494fe96e7b847faae9e76bb2cfd96df): verified_done in one round, 522.47 seconds. Nemotron generated two correct candidates; screen medians were 5.9550x and 2.1666x (ranking only). Live GLM approved worker_a-r1. Full acceptance repeated fixed edges and 2,000 hidden cases, five warmups per program, and 30 fresh timing pairs: median 3.746806497x, 95% CI [3.522457294, 3.808064054]. Full acceptance, not the screen median, is the performance claim. Independent receipt audit and message-ledger verification passed. All three evaluation machines were confirmed deleted; registry check showed 18 total owned development machines, zero unconfirmed. Four primary inference calls used 14,657 tokens; conservative estimated inference cost $0.0248959, separate from Daytona.
+- Accepted source SHA-256: c5173a94f00f94e0371622f56b063a6af7e912dc5f4e82c8056ae646a2506fd1. Receipt: artifacts/evaluations/e258c288309c45a0839bca1a2fcd7a97/receipt.json. Receipt SHA-256: d750d8e64840374fcee3720518abf5d9c90d847d3c58218f8d2714d5c4e24645. Message-ledger final SHA-256: 7fbfd4a08d9f441e2b01824e160a4dbc8210aafed6eb31171cd587349e30b6f6. Local audited summary: artifacts/runs/dev-live-a-20261017-2/summary.json.
+- Remaining: implement shared playbook/regressions, validate a labeled LIVE fallback drill, prepare the official freeze/session, record the demo and submission. The successful development run used primary calls only; it does not establish fallback recovery, shared learning, 150 active minutes, or an official-session result. Both development attempts remain disclosed.

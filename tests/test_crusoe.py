@@ -433,7 +433,9 @@ class FallbackIntegrationTests(unittest.TestCase):
         self.assertEqual([a["outcome"] for a in attempts], ["model_error", "model_error", "ok"])
         self.assertEqual([json.loads(r[3])["model"] for r in opener.requests], [NEMO, NEMO, fallback])
         self.assertTrue(budget.snapshot()["priced"])
-        self.assertEqual(budget.snapshot()["tokens_used"], 40)
+        # No usage was returned for the failed requests: retain their reservations.
+        self.assertEqual(budget.snapshot()["tokens_used"],
+                         2 * (estimate_prompt_tokens(MESSAGES) + 64) + 40)
 
 
 class ModelsCliTests(unittest.TestCase):

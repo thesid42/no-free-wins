@@ -139,7 +139,7 @@ class Orchestrator:
     def _call(self, key, messages, parse):
         return call_with_fallback(self.orders[key], self.client, self.budget, role=key,
                                   messages=messages, parse=parse, max_tokens=self.max_tokens,
-                                  before_attempt=self._remaining)
+                                  before_attempt=self._remaining, after_attempt=self._remaining)
 
     def _harness(self, candidate, mode, rnd, verifier=None):
         """One deadline-checked, validated harness call; terminal on any infrastructure fault."""
@@ -161,6 +161,13 @@ class Orchestrator:
             self._log("evidence_invalid", rnd, candidate_id=candidate["candidate_id"], mode=mode)
             raise _Terminal("failed_evidence", f"invalid {mode} response") from exc
         self._responses.append(response)
+        try:
+            self._remaining()
+        except _Terminal:
+            self._log("harness_returned_late", rnd, candidate_id=candidate["candidate_id"],
+                      mode=mode, receipt_sha256=response["receipt_sha256"],
+                      response_sha256=digest(canonical_json(response)))
+            raise
         return response
 
     def _result_fields(self, candidate, response):

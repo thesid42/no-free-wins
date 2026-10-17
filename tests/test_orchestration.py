@@ -246,7 +246,7 @@ class HappyAndFailureTests(OrchestrationCase):
                                   min_harness_seconds=SMALL_FLOORS)
         self.assertEqual(result.state, "failed_deadline")
         self.assertEqual([c["mode"] for c in self.harness.calls], ["screen", "screen"])
-        self.assertEqual(self.of("verifier_verdict")[0]["approved"], True)
+        self.assertEqual(self.of("verifier_verdict"), [])  # late replies cannot become verdicts
         self.assertEqual(self.of("acceptance_result"), [])
 
     def test_time_floor_blocks_screen_call(self):

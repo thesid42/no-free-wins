@@ -101,7 +101,19 @@ def _read_bounded(response, deadline):
     read = getattr(response, "read1", response.read)
     chunks, size = [], 0
     while True:
-        chunk = read(_CHUNK_BYTES)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ModelError("crusoe response exceeded time/size limit")
+        # Bound the next socket read by the TOTAL remaining time, not the original timeout.
+        socket = getattr(getattr(getattr(response, "fp", None), "raw", None), "_sock", None)
+        if socket is not None:
+            socket.settimeout(remaining)
+        try:
+            chunk = read(_CHUNK_BYTES)
+        except TimeoutError:
+            raise ModelError("crusoe response exceeded time/size limit") from None
+        if time.monotonic() > deadline:
+            raise ModelError("crusoe response exceeded time/size limit")
         if not chunk:
             return b"".join(chunks)
         size += len(chunk)
@@ -158,12 +170,18 @@ class CrusoeClient:
     def _clean(self, text):
         return str(text).replace(self._api_key, "[redacted]")[:_MAX_ERROR_CHARS]
 
-    def _request(self, method, path, payload=None):
+    def _request(self, method, path, payload=None, *, timeout_seconds=None):
         """One HTTP request; returns parsed JSON or raises ModelError (never leaks the key)."""
         headers = {"Authorization": f"Bearer {self._api_key}", "Content-Type": "application/json"}
         body = None if payload is None else json.dumps(payload).encode("utf-8")
+        timeout = self.timeout
+        if timeout_seconds is not None:
+            if (type(timeout_seconds) not in (int, float) or not math.isfinite(timeout_seconds)
+                    or timeout_seconds <= 0):
+                raise ModelError("model call has no valid remaining deadline")
+            timeout = min(timeout, timeout_seconds)
         try:
-            status, raw = self._opener(method, f"{self.base_url}{path}", headers, body, self.timeout)
+            status, raw = self._opener(method, f"{self.base_url}{path}", headers, body, timeout)
         except ModelError as exc:
             raise ModelError(self._clean(exc)) from None
         except _TRANSPORT_ERRORS as exc:
@@ -178,21 +196,26 @@ class CrusoeClient:
         except (ValueError, RecursionError):
             raise ModelError("crusoe returned malformed JSON") from None
 
-    def complete(self, model_id, role, messages, max_tokens):
+    def complete_with_timeout(self, model_id, role, messages, max_tokens, timeout_seconds):
+        return self.complete(model_id, role, messages, max_tokens, timeout_seconds=timeout_seconds)
+
+    def complete(self, model_id, role, messages, max_tokens, *, timeout_seconds=None):
         data = self._request("POST", "/chat/completions",
-                             {"model": model_id, "messages": messages, "max_tokens": max_tokens})
+                             {"model": model_id, "messages": messages, "max_tokens": max_tokens},
+                             timeout_seconds=timeout_seconds)
+        usage = self._reported_tokens(data)
         try:
             choice = data["choices"][0]
             content = choice["message"]["content"]
         except (KeyError, IndexError, TypeError):
-            raise ModelError("crusoe response missing choices[0].message.content") from None
+            raise ModelError("crusoe response missing choices[0].message.content", tokens=usage) from None
         finish = choice.get("finish_reason") if isinstance(choice, dict) else None
         if not isinstance(content, str) or not content.strip():
-            raise ModelError(self._clean(f"crusoe empty content (finish_reason={finish})"))
+            raise ModelError(self._clean(f"crusoe empty content (finish_reason={finish})"), tokens=usage)
         return ModelReply(text=content, tokens=self._tokens(data, messages, max_tokens))
 
     @staticmethod
-    def _tokens(data, messages, max_tokens):
+    def _reported_tokens(data):
         usage = data.get("usage") if isinstance(data, dict) else None
         usage = usage if isinstance(usage, dict) else {}
 
@@ -204,7 +227,12 @@ class CrusoeClient:
         if valid(usage.get("prompt_tokens")) and valid(usage.get("completion_tokens")):
             counts.append(usage["prompt_tokens"] + usage["completion_tokens"])
         best = max(counts, default=0)
-        return best if best > 0 else estimate_prompt_tokens(messages) + max_tokens
+        return best if best > 0 else None
+
+    @staticmethod
+    def _tokens(data, messages, max_tokens):
+        reported = CrusoeClient._reported_tokens(data)
+        return reported if reported is not None else estimate_prompt_tokens(messages) + max_tokens
 
     def list_models(self):
         data = self._request("GET", "/models")

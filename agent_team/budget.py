@@ -70,6 +70,13 @@ class Budget:
         priced = self.usd_per_1k_tokens > 0 or any(p > 0 for p in self.prices.values())
         return {"attempts_used": self.attempts_used, "tokens_used": self.tokens_used,
                 "cost_usd": self.cost_used, "open_reservations": len(self._open),
-                "overrun": self.tokens_used > self.max_tokens, "priced": priced,
+                "overrun": (self.tokens_used > self.max_tokens or
+                            self.cost_used > self.max_cost_usd), "priced": priced,
                 "max_attempts": self.max_attempts, "task_attempts": self.task_attempts,
                 "max_tokens": self.max_tokens, "max_cost_usd": self.max_cost_usd}
+
+    def check_limits(self):
+        if self.tokens_used > self.max_tokens:
+            raise BudgetExhausted("reported token usage exceeded the budget")
+        if self.cost_used > self.max_cost_usd:
+            raise BudgetExhausted("reported cost exceeded the budget")

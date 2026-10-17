@@ -18,11 +18,15 @@ Other lines are ignored. Leading zeros in latency digits are allowed.
 newline, any leading or trailing whitespace, extra tokens, a negative latency, or any non-ASCII
 character is invalid and ignored. Do not use re.match with "$" (it accepts a trailing "\\n") and
 do not use str.split()/strip() (they hide surrounding whitespace). ASCII digits only.
+isdigit() alone accepts extra Unicode digits and is insufficient validation.
+Public examples: 'INFO user=alice latency=0003' is valid; that same string followed by a
+newline is invalid; 'INFO\\tuser=alice latency=3' and 'INFO user=a! latency=3' are invalid.
 Return {"by_level": counts for all four levels (DEBUG, INFO, WARN, ERROR), including zeros,
 "by_user": {user: {"count": n, "latency_sum": total}}}.
 Use integer arithmetic only: no floats, booleans, nulls or custom/lazy objects.
 Output is judged against a reference on hidden inputs and timed against a slow baseline that
 parses lines and then rescans them once per user. Faster honest algorithms are the goal.
+The target is at least 3x speedup while preserving all validation and output requirements.
 No special-casing of inputs, no clock patching, no early exit, no lazy results."""
 
 # Fences pair an opener (with optional tag) to the next bare ```, so a closing fence is never
