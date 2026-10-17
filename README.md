@@ -23,7 +23,7 @@ Status as of October 17, 2026:
 | B: agent orchestration | Event-built `agent_team/` state machine, retries/fallback, budgets, official ledger, and live `run` CLI |
 | Live Crusoe agents and independent model verifier | Validated with real Nemotron workers, GLM verifier, and measured Daytona acceptance |
 | Shared playbook / regression growth | Placeholder interfaces; learning flow remains pending |
-| Official autonomous run and demo | Pending |
+| Official autonomous run and demo | Official session `official-20261017-3`: `verified_done`, median 3.54x, 95% CI 3.49–3.62x, receipt audit and ledger verified (sessions 1–2 failed on Daytona latency; all disclosed in PREP.md). Demo pending |
 
 ### Development evidence
 
