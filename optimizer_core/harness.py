@@ -1,0 +1,325 @@
+"""A's high-level JSON interface. Candidate source is never executed locally."""
+
+import ast
+from dataclasses import asdict
+import math
+from pathlib import Path
+import secrets
+from statistics import median
+import time
+import uuid
+import threading
+from contextlib import contextmanager
+
+from .acceptance import TimingPair, evaluate
+from .backend import InfrastructureError, TrialRequest
+from .canonical import canonical_json, digest, parse_output, strict_json
+from .ledger import append_event
+from .receipts import audit_receipt, create_receipt
+from .tasks import BASELINE_SOURCE, correctness_cases, lines_for, reference
+
+
+class EvaluationDeadline(TimeoutError):
+    pass
+
+
+class CandidateFailure(ValueError):
+    pass
+
+
+def policy_findings(source):
+    """Narrow evidence, not a complete intent classifier."""
+    tree = ast.parse(source.decode("utf-8"))
+    time_names = {"time"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            time_names.update(alias.asname or "time" for alias in node.names
+                              if alias.name == "time")
+    findings = []
+    clocks = {"time", "perf_counter", "monotonic", "perf_counter_ns", "monotonic_ns"}
+    for node in ast.walk(tree):
+        targets = node.targets if isinstance(node, ast.Assign) else (
+            [node.target] if isinstance(node, (ast.AnnAssign, ast.AugAssign)) else [])
+        for target in targets:
+            if (isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name)
+                    and target.value.id in time_names and target.attr in clocks):
+                findings.append("clock_patch")
+    return sorted(set(findings))
+
+
+class Harness:
+    def __init__(self, backend, *, output="artifacts/evaluations", seed=None,
+                 workload_lines=100_000, hidden_cases=2000):
+        self.backend = backend
+        self.output = Path(output)
+        self.seed = seed or secrets.token_hex(16)
+        self.workload_lines, self.hidden_cases = workload_lines, hidden_cases
+        self.origin = getattr(backend, "origin", None)
+        self.lock = threading.RLock()
+        if self.origin not in ("synthetic", "measured"):
+            raise ValueError("backend must declare its trusted measurement origin")
+        if self.origin == "measured" and hidden_cases != 2000:
+            raise ValueError("measured correctness requires all 2000 hidden cases")
+        if not 1 <= workload_lines <= 100_000:
+            raise ValueError("workload exceeds frozen input bounds")
+
+    def _trial(self, source, cases, *, timeout=2):
+        if time.monotonic() + 60 > self.deadline:
+            raise EvaluationDeadline("insufficient time for bounded remote cleanup")
+        payload = canonical_json({"cases": cases})
+        request = TrialRequest(
+            f"trial-{self.trial_count:04d}", source, payload, timeout,
+            self.backend.environment_sha256,
+            outer_timeout_seconds=min(180, self.deadline - time.monotonic()))
+        self.trial_count += 1
+        result = self.backend.run_trial(request)
+        if result.trial_id != request.trial_id or result.origin != self.origin:
+            raise InfrastructureError("backend result identity/origin mismatch")
+        if (not result.cleanup_confirmed or
+                result.environment_sha256 != request.environment_sha256 or
+                not result.proof_bytes or
+                digest(result.proof_bytes) != result.measurement_proof_sha256):
+            raise InfrastructureError("missing or inconsistent execution/cleanup proof")
+        proof_path = self.directory / f"proof-{self.trial_count:04d}.json"
+        proof_path.write_bytes(result.proof_bytes)
+        self.artifacts.append({"path": proof_path.name,
+                               "sha256": result.measurement_proof_sha256})
+        if time.monotonic() > self.deadline:
+            raise EvaluationDeadline("evaluation deadline reached")
+        if result.exit_code != 0 or result.failure_reason:
+            raise CandidateFailure("candidate_process_failed")
+        try:
+            wire = strict_json(parse_output(result.stdout))
+            if set(wire) != {"results"} or type(wire["results"]) is not list:
+                raise ValueError("wrong result envelope")
+            expected = {case["id"]: case for case in cases}
+            found = {}
+            for row in wire["results"]:
+                if (type(row) is not dict or set(row) != {"id", "output"} or
+                        type(row["id"]) is not str or row["id"] not in expected or
+                        row["id"] in found):
+                    raise ValueError("missing/duplicate/unknown result")
+                found[row["id"]] = row["output"]
+            if set(found) != set(expected):
+                raise ValueError("incomplete results")
+            for identifier, case in expected.items():
+                if canonical_json(found[identifier]) != canonical_json(reference(case["input"])):
+                    raise ValueError("output mismatch")
+        except (ValueError, TypeError, KeyError) as exc:
+            raise CandidateFailure("output_or_schema_mismatch") from exc
+        return result, digest(parse_output(result.stdout))
+
+    def _correctness(self, source):
+        batch, batch_bytes = [], 0
+        for case in correctness_cases(self.seed, count=self.hidden_cases,
+                                      full_size=self.workload_lines):
+            size = len(canonical_json(case))
+            if batch and (len(batch) >= 256 or batch_bytes + size > 1 << 20):
+                self._trial(source, batch, timeout=15)
+                batch, batch_bytes = [], 0
+            batch.append(case)
+            batch_bytes += size
+        if batch:
+            self._trial(source, batch, timeout=15)
+
+    def _pairs(self, source, phase, count):
+        pairs = []
+        for index in range(count):
+            case = {"id": f"{phase}-{index}",
+                    "input": lines_for(self.seed, f"{phase}-{index}", self.workload_lines)}
+            order = ("baseline", "candidate") if (
+                int(digest((self.seed + case["id"]).encode()), 16) % 2) else (
+                "candidate", "baseline")
+            results = {}
+            for name in order:
+                try:
+                    results[name] = self._trial(
+                        BASELINE_SOURCE if name == "baseline" else source, [case])
+                except CandidateFailure as exc:
+                    if name == "baseline":
+                        raise InfrastructureError("frozen baseline failed") from exc
+                    raise
+            baseline, before_hash = results["baseline"]
+            candidate, after_hash = results["candidate"]
+            for duration in (baseline.trusted_process_seconds, candidate.trusted_process_seconds):
+                if type(duration) not in (int, float) or not math.isfinite(duration) or duration <= 0:
+                    raise InfrastructureError("invalid process duration")
+            pairs.append(TimingPair(
+                digest(canonical_json({"cases": [case]})), baseline.trusted_process_seconds,
+                candidate.trusted_process_seconds, before_hash, after_hash,
+                candidate.environment_sha256))
+        return pairs
+
+    @contextmanager
+    def _stage(self, seconds):
+        previous = self.deadline
+        self.deadline = min(previous, time.monotonic() + seconds)
+        try:
+            yield
+        finally:
+            self.deadline = previous
+
+    def evaluate_candidate(self, request):
+        with self.lock:
+            return self._evaluate_candidate(request)
+
+    def _evaluate_candidate(self, request):
+        allowed = {"schema_version", "request_id", "session_id", "task_id",
+                   "candidate", "mode", "remaining_wall_seconds", "verifier"}
+        if (type(request) is not dict or set(request) != allowed or
+                type(request["schema_version"]) is not int or request["schema_version"] != 1 or
+                request["task_id"] != "logs-parse-v1" or
+                request["mode"] not in ("screen", "acceptance")):
+            raise ValueError("unsupported candidate-evaluation request")
+        for key in ("request_id", "session_id"):
+            if type(request[key]) is not str or not 1 <= len(request[key]) <= 128:
+                raise ValueError("invalid request/session identifier")
+        candidate = request["candidate"]
+        if type(candidate) is not dict or set(candidate) != {"candidate_id", "source_utf8", "sha256"}:
+            raise ValueError("invalid candidate envelope")
+        if (type(candidate["candidate_id"]) is not str or
+                not 1 <= len(candidate["candidate_id"]) <= 128 or
+                type(candidate["source_utf8"]) is not str):
+            raise ValueError("invalid candidate identity/source")
+        source = candidate["source_utf8"].encode("utf-8")
+        if len(source) > 262_144 or digest(source) != candidate["sha256"]:
+            raise ValueError("candidate source hash/size mismatch")
+        remaining = request["remaining_wall_seconds"]
+        if type(remaining) not in (int, float) or not math.isfinite(remaining) or remaining <= 0:
+            raise ValueError("invalid remaining wall budget")
+        if self.origin == "measured" and not getattr(self.backend, "verified", False):
+            raise InfrastructureError("Daytona must pass isolation probes first")
+        verifier = request["verifier"]
+        approved = (type(verifier) is dict and verifier.get("approved") is True
+                    and type(verifier.get("evidence_ids")) is list
+                    and bool(verifier["evidence_ids"])
+                    and all(type(item) is str and item for item in verifier["evidence_ids"]))
+        self.deadline = time.monotonic() + min(1800, remaining)
+        self.trial_count, self.artifacts = 0, []
+        self.directory = self.output / uuid.uuid4().hex
+        self.directory.mkdir(parents=True)
+        for filename, data in (
+            ("candidate.py", source), ("baseline.py", BASELINE_SOURCE),
+            ("request.json", canonical_json(request)),
+            ("private_inputs.json", canonical_json(
+                {"seed": self.seed, "workload_lines": self.workload_lines,
+                 "hidden_cases": self.hidden_cases})),
+            ("task_definition.py", Path(__file__).with_name("tasks.py").read_bytes()),
+            ("remote_runner.py", Path(__file__).with_name("remote_runner.py").read_bytes()),
+            ("remote_driver.py", Path(__file__).with_name("remote_driver.py").read_bytes()),
+            ("acceptance.py", Path(__file__).with_name("acceptance.py").read_bytes()),
+        ):
+            (self.directory / filename).write_bytes(data)
+            self.artifacts.append({"path": filename, "sha256": digest(data)})
+        import platform
+        from importlib.metadata import PackageNotFoundError, version
+        try:
+            sdk_version = version("daytona")
+        except PackageNotFoundError:
+            sdk_version = "not-installed-synthetic"
+        runtime = canonical_json({"controller_python": platform.python_version(),
+                                  "daytona_sdk": sdk_version,
+                                  "environment_sha256": self.backend.environment_sha256})
+        (self.directory / "runtime.json").write_bytes(runtime)
+        self.artifacts.append({"path": "runtime.json", "sha256": digest(runtime)})
+        response = {"schema_version": 1, "request_id": request["request_id"],
+                    "candidate_id": candidate["candidate_id"], "status": "rejected",
+                    "origin": self.origin, "accepted": False, "correctness_passed": False,
+                    "screen_median_speedup": None, "acceptance": None,
+                    "receipt_id": None, "receipt_sha256": None,
+                    "evidence_ids": [], "feedback_public": []}
+        try:
+            try:
+                findings = policy_findings(source)
+            except (SyntaxError, UnicodeError):
+                raise CandidateFailure("invalid_python_source") from None
+            if findings:
+                raise CandidateFailure("policy_" + findings[0])
+            if request["mode"] == "acceptance" and not approved:
+                raise CandidateFailure("verifier_evidence_required")
+            with self._stage(180):
+                self._correctness(source)
+            response["correctness_passed"] = True
+            if request["mode"] == "screen":
+                with self._stage(300):
+                    pairs = self._pairs(source, "screen", 5)
+                response["screen_median_speedup"] = median(
+                    pair.baseline_seconds / pair.candidate_seconds for pair in pairs)
+                response["status"] = "screened"
+            else:
+                with self._stage(600):
+                    for _ in range(5):
+                        # Warmups use distinct data; no warmup result enters the CI.
+                        case = {"id": f"warmup-{self.trial_count}",
+                                "input": lines_for(self.seed, f"warmup-{self.trial_count}",
+                                                   self.workload_lines)}
+                        self._trial(BASELINE_SOURCE, [case])
+                        self._trial(source, [case])
+                    pairs = self._pairs(source, "acceptance", 30)
+                # No accepted receipt while its evaluation machine is still allocated.
+                if self.origin == "measured":
+                    if not self.backend.close():
+                        raise InfrastructureError("evaluation sandbox cleanup unconfirmed")
+                    cleanup = canonical_json({"sandbox_deleted": True,
+                                              "environment_sha256": self.backend.environment_sha256})
+                    (self.directory / "cleanup.json").write_bytes(cleanup)
+                    self.artifacts.append({"path": "cleanup.json", "sha256": digest(cleanup)})
+                gates = {"correctness_passed": True, "verifier_passed": approved,
+                         "evidence_complete": self.origin == "measured"}
+                receipt = create_receipt(pairs, origin=self.origin, gates=gates,
+                                         artifacts=list(self.artifacts))
+                receipt_path = self.directory / "receipt.json"
+                receipt_path.write_bytes(canonical_json(receipt))
+                anchor = digest(receipt_path.read_bytes())
+                decision = audit_receipt(receipt_path, expected_sha256=anchor)
+                response.update(
+                    status=("accepted" if decision["accepted"] else
+                            "simulated_acceptance" if self.origin == "synthetic" else "bar_not_met"),
+                    accepted=decision["accepted"], acceptance=decision,
+                    receipt_id=self.directory.name, receipt_sha256=anchor)
+            response["evidence_ids"] = [self.directory.name]
+        except EvaluationDeadline:
+            response["status"] = "budget_exhausted"
+            response["feedback_public"] = [{"code": "evaluation_deadline",
+                                           "summary": "Evaluation ended at its wall budget",
+                                           "evidence_ids": [self.directory.name]}]
+        except CandidateFailure as exc:
+            response["feedback_public"] = [{"code": str(exc),
+                                           "summary": "Candidate failed a required gate",
+                                           "evidence_ids": [self.directory.name]}]
+        except InfrastructureError:
+            response["status"] = "infrastructure_error"
+            response["feedback_public"] = [{"code": "execution_or_cleanup_failure",
+                                           "summary": "Trusted execution evidence is unavailable",
+                                           "evidence_ids": [self.directory.name]}]
+        finally:
+            if self.origin == "measured" and not self.backend.close():
+                response["status"] = "infrastructure_error"
+                response["accepted"] = False
+                response["feedback_public"] = [{"code": "cleanup_unconfirmed",
+                                               "summary": "Remote deletion is not confirmed",
+                                               "evidence_ids": [self.directory.name]}]
+        (self.directory / "response.json").write_bytes(canonical_json(response))
+        append_event(self.output / "ledger.jsonl",
+                     {"type": "acceptance" if response["accepted"] else "evaluation",
+                      "session": request["session_id"], "origin": self.origin,
+                      "response_sha256": digest(canonical_json(response)),
+                      "receipt_sha256": response["receipt_sha256"],
+                      "accepted": response["accepted"]})
+        return response
+
+
+def evaluate_candidate(request):
+    """B's drop-in API; one disposable machine per evaluation, serial timing."""
+    if type(request) is not dict:
+        raise ValueError("evaluation request must be a JSON object")
+    with _default_lock:
+        from .backend import verified_backend
+        from .sessions import load_session
+        session = load_session(request.get("session_id", ""))
+        with verified_backend() as backend:
+            return Harness(backend, seed=session["seed"],
+                           workload_lines=session["workload_lines"]).evaluate_candidate(request)
+
+
+_default_lock = threading.RLock()
