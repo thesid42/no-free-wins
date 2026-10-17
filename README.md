@@ -19,8 +19,8 @@ Status as of October 17, 2026:
 | Workload | `logs-parse-v1`: strict parsing and aggregation with a trusted oracle |
 | Acceptance | Correct outputs, 30 timing pairs, at least 3x median speedup and a 95% bootstrap CI lower bound of at least 3x |
 | Evidence | Raw execution proofs, artifact hashes, receipts, audit, and a hash-chain ledger |
-| Local tests | 43 tests passing |
-| B: agent orchestration | Pending merge and integration from Anmol's work |
+| Local tests | 137 tests passing (43 harness + 94 agent orchestration) |
+| B: agent orchestration | Event-built `agent_team/` state machine, contract v1 client, fake harness and synthetic `simulate` CLI; fixture models only |
 | Live Crusoe agents and independent model verifier | Pending integration and validation |
 | Official autonomous run and demo | Pending |
 
@@ -86,7 +86,8 @@ These commands use Daytona credits. `--reference` measures the built-in known so
 
 ## What's left
 
-- [ ] **B / Anmol:** bring in `agent_team/`, orchestration tests, dependencies, and the preparation revision. Implement the planner, two distinct worker strategies, and independent verifier.
+- [x] **B / Anmol:** `agent_team/` orchestration (planner → two distinct workers → screen → verifier → acceptance), bounded primary/retry/fallback, reserve-before-call budgets, deadlines, hash-chained official ledger, and orchestration tests. Built on October 17 with fixture models and a fake harness.
+- [ ] **B:** live Crusoe `ModelClient` adapter with per-model prices.
 - [ ] **B:** validate live Crusoe model access, request/response handling, bounded retries and fallback, attempt/token/cost budgets, and terminal failure paths.
 - [ ] **Joint:** replace B's fake harness with `optimizer_core.harness.evaluate_candidate`; connect candidate hashes, verifier evidence, receipts, and one official ledger writer.
 - [ ] **A + joint:** validate the merged path, preserve both preparation baselines, freeze the evaluation configuration, and prepare a fresh official session before agents start.
@@ -102,6 +103,6 @@ Extra workloads, a larger zoo, the paired playbook study, long-duration claims, 
 | [Sid / thesid42](https://github.com/thesid42) — A | Deterministic evaluation, Daytona isolation, timing, evidence, and audit |
 | [Anmol / Anmol-tech](https://github.com/Anmol-tech) — B | Agent orchestration, live model adapters, verifier, recovery, and shared playbook |
 
-`optimizer_core/` contains A's implementation; `tests/` contains its automated checks. [PREP.md](PREP.md) is the detailed working plan and integration contract. `pre_event_manifest.json` preserves the original preparation inventory. `.env.example` lists supported local settings. Credentials, private seeds, virtual environments, and generated artifacts are Git-ignored.
+`optimizer_core/` contains A's implementation; `agent_team/` contains B's event-built orchestration; `tests/` contains automated checks for both. [PREP.md](PREP.md) is the detailed working plan and integration contract. `pre_event_manifest.json` preserves the original preparation inventory. `.env.example` lists supported local settings. Credentials, private seeds, virtual environments, and generated artifacts are Git-ignored.
 
 The deterministic foundation was prepared before the event. Git baseline `b5e1933` records its import; it is not a trusted timestamp of original authorship. Naming, repository setup, and this overview were added afterward. Event-built features will be recorded in PREP.md and distinguished from preparation in the submission.
