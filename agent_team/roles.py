@@ -14,6 +14,10 @@ Task logs-parse-v1. Write a Python function solve(lines) in standard-library Pyt
 lines is a list of strings. A line is valid only if it exactly matches the regex:
   (DEBUG|INFO|WARN|ERROR) user=([A-Za-z0-9_-]{1,32}) latency=([0-9]{1,7})
 Other lines are ignored. Leading zeros in latency digits are allowed.
+"Exactly matches" means re.fullmatch semantics on the whole string: a line with a trailing
+newline, any leading or trailing whitespace, extra tokens, a negative latency, or any non-ASCII
+character is invalid and ignored. Do not use re.match with "$" (it accepts a trailing "\\n") and
+do not use str.split()/strip() (they hide surrounding whitespace). ASCII digits only.
 Return {"by_level": counts for all four levels (DEBUG, INFO, WARN, ERROR), including zeros,
 "by_user": {user: {"count": n, "latency_sum": total}}}.
 Use integer arithmetic only: no floats, booleans, nulls or custom/lazy objects.
