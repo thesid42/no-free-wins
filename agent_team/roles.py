@@ -21,28 +21,119 @@ Output is judged against a reference on hidden inputs and timed against a slow b
 parses lines and then rescans them once per user. Faster honest algorithms are the goal.
 No special-casing of inputs, no clock patching, no early exit, no lazy results."""
 
-_FENCE = re.compile(r"```python[ \t]*\r?\n(.*?)```", re.DOTALL)
+# Fences pair an opener (with optional tag) to the next bare ```, so a closing fence is never
+# mistaken for an opener; only blocks tagged exactly "python" count as candidate code.
+_FENCE = re.compile(r"```([\w+.-]*)[ \t]*\r?\n(.*?)```", re.DOTALL)
+_PYTHON_TAGS = {"python", "py", "python3"}
+_THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL)
 
 
-def _json_object(text, keys):
-    try:
-        value = strict_json(text.strip())
-    except (ValueError, RecursionError, AttributeError) as exc:
-        raise MalformedOutput("invalid JSON") from exc
-    if type(value) is not dict or set(value) != keys:
-        raise MalformedOutput("unexpected JSON shape")
-    return value
+def _strip_reasoning(text):
+    """Drop <think> reasoning so only the final answer is parsed. Complete blocks go first; a
+    stray </think> (opening tag lived in the prompt) drops everything before the last one, unless
+    that reasoning contains a "{" (it may hold a draft answer: fail closed); a leading <think>
+    that never closes means the answer never arrived, so nothing is left."""
+    text = _THINK_BLOCK.sub("", text)
+    if "</think>" in text:
+        before, _, text = text.rpartition("</think>")
+        if "{" in before:
+            raise MalformedOutput("reasoning with a JSON-like object but no opening <think>")
+    if text.lstrip().startswith("<think>"):
+        return ""
+    return text
+
+
+def _unique_pairs(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate key")
+        result[key] = value
+    return result
+
+
+def _reject_constant(value):
+    raise ValueError("unsupported number")
+
+
+_DECODER = json.JSONDecoder(object_pairs_hook=_unique_pairs, parse_constant=_reject_constant)
+_OPENER = re.compile(r"[{\[]")
+MAX_JSON_REPLY_CHARS = 64 * 1024
+MAX_FAILED_DECODES = 256
+
+
+def _dicts_with_keys(value, keys):
+    """Every dict carrying the keys, at any depth, as (dict, nested) with nested False only for the
+    decoded value itself. Iterative: decoded depth is bounded but the walk must not recurse."""
+    found, stack = [], [(value, False)]
+    while stack:
+        item, nested = stack.pop()
+        if type(item) is dict:
+            if keys <= set(item):
+                found.append((item, nested))
+            stack.extend((child, True) for child in item.values())
+        elif type(item) is list:
+            stack.extend((child, True) for child in item)
+    return found
+
+
+def _json_object(text, keys, normalize, marker):
+    """Find the one JSON object carrying the required keys in the reply (prose, fences or quoted
+    code around it are fine) and fail closed on anything unclear. Every matching dict at any depth
+    counts; one nested inside an array or another object is never accepted; several top-level ones
+    must agree on the required fields; and the number of quoted `marker` keys in the raw text must
+    equal the number of objects found, so an undecodable draft (NaN, duplicate key, trailing
+    comma, single quotes) cannot hide next to a decodable one. Extra keys are dropped by
+    normalize(), which raises MalformedOutput on a bad shape."""
+    if type(text) is not str:
+        raise MalformedOutput("reply must be text")
+    text = _strip_reasoning(text)
+    if len(text) > MAX_JSON_REPLY_CHARS:
+        raise MalformedOutput("reply too long to parse")
+    found, index, failures = [], 0, 0
+    while True:
+        match = _OPENER.search(text, index)
+        if match is None:
+            break
+        index = match.start()
+        try:
+            value, end = _DECODER.raw_decode(text, index)
+        except (ValueError, RecursionError):
+            failures += 1
+            if failures > MAX_FAILED_DECODES:
+                raise MalformedOutput("too many undecodable JSON openers") from None
+            index += 1
+            continue
+        found.extend(_dicts_with_keys(value, keys))
+        index = end
+    quoted = len(re.findall(r"""["']""" + marker + r"""["']\s*:""", text))
+    if quoted != len(found):
+        raise MalformedOutput(f"ambiguous: {quoted} quoted {marker!r} keys but {len(found)} objects")
+    if not found:
+        raise MalformedOutput("no JSON object with the required keys")
+    if any(nested for _, nested in found):
+        raise MalformedOutput("ambiguous: matching object nested inside another value")
+    normalized = [normalize(item) for item, _ in found]
+    if any(item != normalized[0] for item in normalized[1:]):
+        raise MalformedOutput("ambiguous: several differing JSON objects with the required keys")
+    return normalized[0]
+
+
+def _normalize_plan(value):
+    plan = value["strategies"]
+    if type(plan) is not list:
+        raise MalformedOutput("strategies must be a list")
+    entries = []
+    for item in plan:
+        if (type(item) is not dict or type(item.get("strategy_id")) is not str
+                or type(item.get("description")) is not str):
+            raise MalformedOutput("invalid strategy entry")
+        entries.append({"strategy_id": item["strategy_id"], "description": item["description"]})
+    return {"strategies": entries}
 
 
 def parse_plan(text):
-    plan = _json_object(text, {"strategies"})["strategies"]
-    if type(plan) is not list:
-        raise MalformedOutput("strategies must be a list")
-    for item in plan:
-        if (type(item) is not dict or set(item) != {"strategy_id", "description"} or
-                type(item["strategy_id"]) is not str or type(item["description"]) is not str):
-            raise MalformedOutput("invalid strategy entry")
-    return plan
+    return _json_object(text, {"strategies"}, _normalize_plan, "strategies")["strategies"]
 
 
 def distinct_strategies(strategies):
@@ -56,8 +147,8 @@ def distinct_strategies(strategies):
 def parse_candidate(text):
     if type(text) is not str:
         raise MalformedOutput("reply must be text")
-    blocks = _FENCE.findall(text)
-    if len(blocks) != 1 or text.count("```") != 2:
+    blocks = [body for tag, body in _FENCE.findall(_strip_reasoning(text)) if tag.lower() in _PYTHON_TAGS]
+    if len(blocks) != 1:
         raise MalformedOutput("expected exactly one python code block")
     source = blocks[0]
     try:
@@ -79,11 +170,14 @@ def parse_candidate(text):
     raise MalformedOutput("missing top-level solve(lines)")
 
 
-def parse_verdict(text, expected_sha256):
-    verdict = _json_object(text, {"approved", "candidate_sha256", "rationale"})
-    if (type(verdict["approved"]) is not bool or type(verdict["candidate_sha256"]) is not str
-            or type(verdict["rationale"]) is not str):
+def _normalize_verdict(value):
+    if type(value["approved"]) is not bool or type(value["candidate_sha256"]) is not str:
         raise MalformedOutput("invalid verdict field types")
+    return {"approved": value["approved"], "candidate_sha256": value["candidate_sha256"]}
+
+
+def parse_verdict(text, expected_sha256):
+    verdict = _json_object(text, {"approved", "candidate_sha256"}, _normalize_verdict, "approved")
     if verdict["candidate_sha256"] != expected_sha256:
         return {**verdict, "approved": False, "mismatch": True}
     return verdict

@@ -19,7 +19,7 @@ Status as of October 17, 2026:
 | Workload | `logs-parse-v1`: strict parsing and aggregation with a trusted oracle |
 | Acceptance | Correct outputs, 30 timing pairs, at least 3x median speedup and a 95% bootstrap CI lower bound of at least 3x |
 | Evidence | Raw execution proofs, artifact hashes, receipts, audit, and a hash-chain ledger |
-| Local tests | 176 tests passing (43 harness + 133 agent orchestration and Crusoe adapter) |
+| Local tests | 232 tests passing (43 harness + 189 agent orchestration, Crusoe adapter and live run) |
 | B: agent orchestration | Event-built `agent_team/` state machine, contract v1 client, fake harness and synthetic `simulate` CLI; fixture models only |
 | Live Crusoe agents and independent model verifier | Adapter built and live model listing checked; lineup chosen (verifier `zai-org/GLM-5.3-Flash`); live run pending |
 | Official autonomous run and demo | Pending |

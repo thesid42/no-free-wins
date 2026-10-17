@@ -1,6 +1,7 @@
-"""CLI: python -m agent_team simulate. Fully synthetic; never a verified result."""
+"""CLI: python -m agent_team simulate (fully synthetic, never a verified result), models, run."""
 
 import argparse
+from datetime import datetime, timezone
 import json
 import math
 from pathlib import Path
@@ -8,7 +9,7 @@ import sys
 
 from optimizer_core.ledger import verify_ledger
 
-from . import contract
+from . import contract, live
 from .budget import Budget
 from .calls import ModelOrder
 from .crusoe import CrusoeClient, price_per_1k, resolve_model
@@ -136,6 +137,30 @@ def list_models(resolve_names):
             "resolved": resolved}
 
 
+LIVE_NOTE = ("development live run; verified_done only from a measured, receipted "
+             "harness acceptance")
+
+
+def _error(exc):
+    return {"error": f"{type(exc).__name__}: {exc}"[:300]}
+
+
+def run_live(args):
+    """Full live run (real Crusoe models, real harness). Exit 0 only on verified_done."""
+    orchestrator, info = live.build_live_run(
+        session_id=args.session_id, output_dir=args.output, deadline_seconds=args.deadline,
+        max_rounds=args.max_rounds, max_cost_usd=args.max_cost_usd, max_tokens=args.max_tokens)
+    result = orchestrator.run()
+    records = verify_ledger(result.ledger_path)
+    return result, {
+        "run_id": result.run_id, "state": result.state, "rounds": result.rounds,
+        "ledger_path": result.ledger_path, "ledger_final_sha256": result.ledger_final_sha256,
+        "ledger_verified": bool(records) and records[-1]["sha256"] == result.ledger_final_sha256,
+        "budget": result.budget,
+        "last_forwarded_candidate_id": result.events[-1]["last_forwarded_candidate_id"],
+        "models": info["models"], "note": LIVE_NOTE}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="agent_team", description="B orchestration, fixtures only")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -149,7 +174,21 @@ def main(argv=None):
     mod = commands.add_parser("models", help="list the models the Crusoe key can see (live call)")
     mod.add_argument("--resolve", action="append", default=[], metavar="NAME",
                      help="resolve NAME against the live listing (repeatable)")
+    run = commands.add_parser(
+        "run", help="live run: Crusoe models, priced budget, real harness (spends money; "
+                    "use --check first)")
+    run.add_argument("--session-id", required=True, help="prepared session id")
+    run.add_argument("--output", type=Path, default=None,
+                     help="fresh or empty directory (default artifacts/runs/<session>-<UTC time>)")
+    run.add_argument("--deadline", type=float, default=1800, help="wall deadline in seconds (max 1800)")
+    run.add_argument("--max-rounds", type=int, default=3)
+    run.add_argument("--max-cost-usd", type=float, default=5.0, help="inference cost cap (max 25)")
+    run.add_argument("--max-tokens", type=int, default=8192, help="max tokens per model call")
+    run.add_argument("--check", action="store_true",
+                     help="preflight, list models, resolve lineup and budget; no inference, no sandbox")
     args = parser.parse_args(argv)
+    if args.command == "run":
+        return main_run(args)
     if args.command == "models":
         try:
             print(json.dumps(list_models(args.resolve), indent=2))
@@ -168,6 +207,38 @@ def main(argv=None):
     result, summary = simulate(output, inject_failures=args.inject_failures, deadline=args.deadline)
     print(json.dumps(summary, indent=2))
     return 0 if result.state == "simulation_completed" else 1
+
+
+def main_run(args):
+    try:
+        live.check_session_id(args.session_id)
+        live.check_deadline(args.deadline)
+        live.check_cost(args.max_cost_usd)
+        live.check_max_tokens(args.max_tokens)
+        if args.max_rounds < 1:
+            raise ValueError("--max-rounds must be positive")
+        if args.output is None:
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            args.output = Path("artifacts/runs") / f"{args.session_id}-{stamp}"
+        if not args.check:
+            live.check_output_dir(args.output)
+    except ValueError as exc:
+        print(str(exc)[:300], file=sys.stderr)
+        return 2
+    try:
+        if args.check:
+            info = live.check_live(
+                args.session_id, deadline_seconds=args.deadline, max_rounds=args.max_rounds,
+                max_cost_usd=args.max_cost_usd, max_tokens=args.max_tokens)
+            print(json.dumps({"check": "ok", **info}, indent=2))
+            return 0
+        result, summary = run_live(args)
+    except Exception as exc:  # one-line error, never a traceback (e.g. a corrupt session file)
+        failure = _error(exc)
+        print(json.dumps({"check": "failed", **failure} if args.check else failure), file=sys.stderr)
+        return 1
+    print(json.dumps(summary, indent=2))
+    return 0 if result.state == "verified_done" else 1
 
 
 if __name__ == "__main__":

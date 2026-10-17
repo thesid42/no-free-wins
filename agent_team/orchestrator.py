@@ -29,7 +29,7 @@ MAX_DEADLINE_SECONDS = 1800
 # A's real stage bounds (the harness _stage budgets and the 60 s trial floor): 180 s
 # correctness + 5 pairs + margin for screen, 600 s acceptance + margin. Real-harness runs keep these.
 DEFAULT_MIN_HARNESS_SECONDS = {"screen": 240, "acceptance": 840}
-ANNOTATION_TYPES = {"fault_injection", "simulation_label"}
+ANNOTATION_TYPES = {"fault_injection", "simulation_label", "run_label"}
 RESERVED_EVENT_KEYS = {"type", "run_id", "utc", "round", "kind", "rnd"}  # incl. _log params
 
 
@@ -44,7 +44,7 @@ def _number(value):
 def _check_annotation(item):
     """Labeled drill/simulation notes only; they can never impersonate controller events."""
     if type(item) is not dict or item.get("type") not in ANNOTATION_TYPES:
-        raise ValueError("annotation type must be fault_injection or simulation_label")
+        raise ValueError("annotation type must be fault_injection, simulation_label or run_label")
     for key, value in item.items():
         if type(key) is not str or (key in RESERVED_EVENT_KEYS and key != "type"):
             raise ValueError("annotation uses a reserved or non-string key")
@@ -75,7 +75,7 @@ class Orchestrator:
                  deadline_seconds, max_rounds=3, screen_bar=3.0, clock=time.monotonic,
                  utcnow=_utcnow, new_id=lambda: uuid.uuid4().hex,
                  task_summary=roles.TASK_SUMMARY, playbook=None, annotations=(),
-                 min_harness_seconds=None, preflight=None):
+                 min_harness_seconds=None, preflight=None, max_tokens=4096):
         if not callable(evaluate):
             raise ValueError("evaluate must be callable")
         if (type(orders) is not dict or set(orders) != ORDER_KEYS or
@@ -97,9 +97,12 @@ class Orchestrator:
         if (type(floors) is not dict or set(floors) != {"screen", "acceptance"} or
                 not all(_number(v) and v >= 0 for v in floors.values())):
             raise ValueError("min_harness_seconds needs non-negative screen and acceptance floors")
+        if type(max_tokens) is not int or max_tokens < 1:
+            raise ValueError("max_tokens must be a positive integer")
         if preflight is not None and not callable(preflight):
             raise ValueError("preflight must be callable")
         self.min_harness_seconds, self._preflight = dict(floors), preflight
+        self.max_tokens = max_tokens
         self._evaluate_fn, self.client, self.budget = evaluate, client, budget
         self.ledger_path, self.session_id, self.orders = Path(ledger_path), session_id, orders
         self.deadline_seconds = min(deadline_seconds, MAX_DEADLINE_SECONDS)
@@ -135,7 +138,8 @@ class Orchestrator:
 
     def _call(self, key, messages, parse):
         return call_with_fallback(self.orders[key], self.client, self.budget, role=key,
-                                  messages=messages, parse=parse, before_attempt=self._remaining)
+                                  messages=messages, parse=parse, max_tokens=self.max_tokens,
+                                  before_attempt=self._remaining)
 
     def _harness(self, candidate, mode, rnd, verifier=None):
         """One deadline-checked, validated harness call; terminal on any infrastructure fault."""

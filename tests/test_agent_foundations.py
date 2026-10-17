@@ -342,10 +342,12 @@ class RoleTests(unittest.TestCase):
         for bad in ("no fence", f"```python\n{GOOD}```\n```python\n{GOOD}```",
                     "```python\ndef other(lines):\n    pass\n```",
                     "```python\ndef solve(a, b):\n    pass\n```",
-                    "```python\ndef solve(lines:\n```",
-                    f"```python\n{GOOD}```\n```\nextra\n```"):
+                    "```python\ndef solve(lines:\n```"):
             with self.assertRaises(MalformedOutput, msg=bad):
                 parse_candidate(bad)
+        # Non-python fences elsewhere are tolerated; only python blocks are counted.
+        self.assertEqual(parse_candidate(f"```python\n{GOOD}```\n```\nextra\n```"), GOOD)
+        self.assertEqual(parse_candidate(f"```text\nnote\n```\n```python\n{GOOD}```"), GOOD)
 
     def test_parse_verdict(self):
         sha = "b" * 64
