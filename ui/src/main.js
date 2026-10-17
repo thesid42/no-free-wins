@@ -1,10 +1,11 @@
 // UI controller. Replays recorded runs through the local bridge (adapter.js), falls back to the scripted
-// demo when the API is unreachable and, when the bridge reports launch enabled, drives the analyst flow:
-// analyze -> (answer)* -> approve -> live run. The browser never fetches the repo, calls a model or runs
-// repo code; every spend (analyze, answer, approve) follows an explicit user confirmation.
+// demo when the API is unreachable and, when the bridge reports launch enabled, drives either the autonomous
+// job (one confirmation, then analyze -> repair -> run -> re-plan with no more questions; the default) or the
+// step-by-step analyst flow: analyze -> (answer)* -> approve -> live run. The browser never fetches the repo,
+// calls a model or runs repo code; every spend (auto, analyze, answer, approve) follows an explicit user confirmation.
 // Controller-facing types live in contracts.d.ts.
 import { codeBytes, proof, phaseNames, phaseNotes } from './demo-data.js';
-import { render, repoShort } from './scenes.js';
+import { render, repoShort, timelineModel, stepIcon, autoOutcome } from './scenes.js';
 import { createAdapter, repoUrlProblem, isJobActive, ApiError } from './adapter.js';
 
 const adapter = createAdapter();
@@ -22,14 +23,21 @@ const MODES = {
     badge: 'Connected · launch enabled',
     notice: 'Connected · launch enabled. An analyst agent reads the public GitHub repo you paste, which uses Crusoe credits. Nothing runs until you approve a proposal, and repo code only ever runs in the Daytona sandbox.',
   },
+  launchAuto: {
+    badge: 'Connected · launch enabled',
+    notice: 'Connected · launch enabled. Autonomous mode: after one spending confirmation the agents analyze the public GitHub repo you paste, fix their own proposal, run and re-plan with no further questions, using Crusoe and Daytona credits up to the configured cap. Repo code only ever runs in the Daytona sandbox.',
+  },
   down: { badge: 'Demo mode · backend disconnected', notice: 'Demo mode · local scenes and scripted chat. Backend disconnected. Links are never fetched.' },
 };
+const AUTO_RUN_ID = /^[A-Za-z0-9._-]{1,128}$/;
 const ANALYST_STATUS = ['proposal', 'questions', 'needs_input', 'not_feasible'];
 const HINT_TAIL = 'Enter to send · Shift+Enter for a new line';
 const APPROVE_TEXT = 'Runs prepare in the Daytona sandbox (~2 min) and a live agent run (≤30 min, Crusoe ≤ config cap). Continue?';
 const PREPARE_LABEL = 'Preparing sandbox: generating hidden cases and recording the original function’s outputs';
 const MODE_COPY = {
   start: { hint: `Send to analyze the repo · you confirm before anything is spent · ${HINT_TAIL}`, placeholder: 'What should be optimized? e.g. make the CSV parser faster', send: 'Analyze ↗', label: 'Analyze the repo with the analyst agent' },
+  startAuto: { hint: `Send to run fully autonomously · you confirm the spend once, then no more questions · ${HINT_TAIL}`, placeholder: 'What should be optimized? e.g. make the CSV parser faster', send: 'Run autonomously ↗', label: 'Run the agents autonomously on the repo' },
+  autoBusy: { hint: 'The agents are running on their own · no questions will be asked · cancel from the stage if needed', placeholder: 'The agents are working on their own…', send: '↑', label: 'Send message' },
   answer: { hint: `Your next message goes to the analyst agent (uses Crusoe credits) · ${HINT_TAIL}`, placeholder: 'Answer the analyst…', send: '↑', label: 'Send answer to the analyst' },
   idle: { hint: 'Use Retry or Try a different prompt on the message above', placeholder: 'Use the buttons on the message above…', send: '↑', label: 'Send message' },
   decide: { hint: 'Choose Approve & run or Suggest changes on the proposal; nothing is sent until you do', placeholder: 'Approve the proposal, or choose Suggest changes first…', send: '↑', label: 'Send message' },
@@ -58,9 +66,10 @@ const view = {
   playing: false,
   timer: null,
   options: { renderer: 'Line graph' },
+  mode: 'auto', // start-screen choice: 'auto' (default) or 'manual' (step-by-step)
   api: 'checking',
   launch: false,
-  analysis: null, // { repoUrl, prompt, proposalId, last, awaiting, failed }
+  analysis: null, // { repoUrl, prompt, proposalId, last, awaiting, failed, auto, outcome }
   job: null, // the tracked launch job
   busy: false, // a launch request is in flight
   runs: [],
@@ -108,13 +117,15 @@ function refresh() {
 
 function composerMode() {
   if (view.run) return view.run.live ? 'liveRun' : 'run';
+  if (view.analysis?.auto) return jobActive() ? 'autoBusy' : 'idle';
   if (view.analysis) return jobActive() ? 'busy' : view.analysis.awaiting ? 'answer' : view.analysis.last?.type === 'result' ? 'decide' : 'idle';
-  if (view.launch && view.api === 'up' && view.phase === 0) return 'start';
+  if (view.launch && view.api === 'up' && view.phase === 0) return view.mode === 'manual' ? 'start' : 'startAuto';
   return 'demo';
 }
 
 function applyMode() {
-  const mode = MODES[modeKey()];
+  const autoNotice = view.launch && view.api === 'up' && (view.analysis ? view.analysis.auto : view.mode === 'auto');
+  const mode = MODES[autoNotice ? 'launchAuto' : modeKey()];
   app.querySelector('.demo-badge').textContent = mode.badge;
   app.querySelector('.demo-notice').textContent = mode.notice;
   const key = composerMode();
@@ -300,17 +311,20 @@ async function loadResult(run) {
   await run.resultPromise?.catch(() => {});
   await fetchResult(run);
   if (view.run !== run) return;
-  if (view.follow && view.phase !== 6) go(6, true);
+  // Between the runs of an autonomous job the next run replaces this one; the job's end decides what to show.
+  const hold = !!run.auto && jobActive();
+  if (!hold && view.follow && view.phase !== 6) go(6, true);
   else go(view.phase, false);
 }
 
 // Replays a recorded run, or (live) follows the ledger of a run just launched from this page.
-async function replay(meta, { live = false } = {}) {
+async function replay(meta, { live = false, auto = false, instant = false } = {}) {
   abortReplay();
   stop();
   chatController?.abort();
   const run = newRun(meta);
   run.live = live;
+  run.auto = auto;
   view.run = run;
   view.follow = true;
   view.sourceOpen = false;
@@ -322,7 +336,7 @@ async function replay(meta, { live = false } = {}) {
   }
   go(1, true);
   try {
-    const options = { speed: SPEED_PARAM[view.speed], onEnd: (state) => { run.endState = state; } };
+    const options = { speed: instant ? 0 : SPEED_PARAM[view.speed], onEnd: (state) => { run.endState = state; } };
     for await (const event of adapter.events(meta.runId, run.controller.signal, options)) {
       if (view.run !== run) return;
       onEvent(run, event);
@@ -524,26 +538,64 @@ async function onConfirmClick(button) {
 }
 
 function progressLabel(job) {
+  if (job.kind === 'auto') {
+    const rows = timelineModel(job.steps);
+    return `Running autonomously · ${rows.length ? rows[rows.length - 1].label : 'starting'}`;
+  }
   if (job.kind === 'approve') return job.runStarted ? 'Run started; following its live ledger' : PREPARE_LABEL;
   return job.kind === 'answer' ? 'Analyst is revising the proposal' : 'Reading the repo';
 }
 
 function addProgress(job) {
   const article = el('article', 'message agent progress');
-  article.append(el('div', 'speaker', job.kind === 'approve' ? '✳ Sandbox' : '✳ Analyst'));
+  article.append(el('div', 'speaker', job.kind === 'approve' ? '✳ Sandbox' : job.kind === 'auto' ? '✳ Autonomous run' : '✳ Analyst'));
   const body = el('p', 'chat-body');
   job.textNode = el('span', '', '');
   job.clockNode = el('span', 'nfw-muted', '');
   job.clockNode.setAttribute('aria-hidden', 'true'); // ticks every second; keep it out of the live region
   body.append(job.textNode, document.createTextNode(' '), job.clockNode);
   article.append(body);
+  if (job.kind === 'auto') {
+    job.timelineNode = el('ol', 'timeline');
+    job.timelineNode.setAttribute('aria-label', 'Autonomous run steps');
+    article.append(job.timelineNode);
+  }
   messages.append(article);
   updateProgress(job);
   conversation.scrollTop = conversation.scrollHeight;
 }
 
+const STEP_WORD = { ok: 'done', failed: 'failed', started: 'in progress' };
+
+// Rebuilds the chat timeline only when a step changed, so the live region is not re-announced on every poll.
+function updateTimeline(job) {
+  if (!job.timelineNode) return false;
+  const rows = timelineModel(job.steps);
+  const signature = JSON.stringify(rows);
+  if (signature === job.timelineSignature) return false;
+  job.timelineSignature = signature;
+  job.timelineNode.replaceChildren(...rows.map((row) => {
+    const item = el('li', `tl-${row.status}`);
+    const icon = el('span', 'tl-icon', stepIcon(row.status));
+    icon.setAttribute('role', 'img');
+    icon.setAttribute('aria-label', STEP_WORD[row.status] || row.status);
+    const body = el('span', 'tl-body');
+    body.append(el('strong', '', row.label));
+    if (row.message) body.append(el('span', 'tl-msg', row.message));
+    item.append(icon, body);
+    return item;
+  }));
+  conversation.scrollTop = conversation.scrollHeight;
+  return true;
+}
+
 function updateProgress(job) {
   if (!job.textNode || !jobActive()) return;
+  if (job.kind === 'auto') {
+    job.textNode.textContent = `${progressLabel(job)}…`;
+    job.clockNode.textContent = `(elapsed ${clock(Date.now() - job.startedAt)})`;
+    return;
+  }
   const phase = job.phase && !job.runStarted ? ` · ${String(job.phase).slice(0, 80)}` : '';
   job.textNode.textContent = `${progressLabel(job)}…${phase}`;
   job.clockNode.textContent = `(elapsed ${clock(Date.now() - job.startedAt)})`;
@@ -603,6 +655,13 @@ function trackJob(kind, started, controller) {
     runStarted: false,
     textNode: null,
     clockNode: null,
+    // autonomous jobs only
+    sessionPrefix: typeof started.sessionPrefix === 'string' ? started.sessionPrefix : null,
+    steps: [],
+    currentRunId: null,
+    runCount: 0,
+    timelineNode: null,
+    timelineSignature: '',
   };
   view.job = job;
   addProgress(job);
@@ -619,6 +678,14 @@ function onJobUpdate(job, snapshot) {
   job.status = snapshot.status;
   job.phase = typeof snapshot.phase === 'string' ? snapshot.phase : '';
   if (job.kind === 'approve' && !job.runStarted && typeof snapshot.runId === 'string' && snapshot.runId && isJobActive(snapshot.status)) startLive(job, snapshot);
+  if (job.kind === 'auto') {
+    job.steps = Array.isArray(snapshot.steps) ? snapshot.steps.filter((step) => step && typeof step === 'object').slice(-200) : job.steps;
+    const changed = updateTimeline(job);
+    // A new run directory (run 1, then run 2 after the re-plan) restarts the live tail on that run.
+    const id = snapshot.currentRunId;
+    if (typeof id === 'string' && AUTO_RUN_ID.test(id) && id !== job.currentRunId && isJobActive(snapshot.status)) startAutoRun(job, snapshot, id);
+    else if (changed) refresh();
+  }
   updateProgress(job);
   if (!view.run) refresh();
   else syncUi();
@@ -642,6 +709,24 @@ function startLive(job, snapshot) {
   replay(meta, { live: true });
 }
 
+function startAutoRun(job, snapshot, runId) {
+  job.currentRunId = runId;
+  job.runCount += 1;
+  const meta = {
+    runId,
+    sessionId: '',
+    kind: 'repo',
+    label: `Live run ${job.runCount} · ${repoShort(view.analysis?.repoUrl)}`,
+    state: 'running',
+    startedUtc: snapshot.startedUtc || null,
+    endedUtc: null,
+    taskId: '',
+    verified: null,
+  };
+  addMessage('agent', `Run ${job.runCount} started (${runId}); following its ledger live. Speedups are only claimed from the audited result at the end.`, '✳ Live run');
+  replay(meta, { live: true, auto: true });
+}
+
 function onJobLost(job, failure) {
   if (view.job !== job) return;
   job.status = 'failed';
@@ -658,6 +743,10 @@ function onJobEnd(job, snapshot) {
   stopTicker();
   job.status = snapshot.status;
   const a = view.analysis;
+  if (job.kind === 'auto') {
+    endAuto(job, snapshot);
+    return;
+  }
   if (job.kind === 'approve') {
     loadRuns().then(() => { if (!view.run && view.phase === 0) redraw(); });
     if (snapshot.status === 'done' && job.runStarted) {
@@ -705,6 +794,86 @@ function onJobEnd(job, snapshot) {
   redraw();
 }
 
+function autoFailedCard(message, cancelled = false) {
+  const card = newCard(`✳ Autonomous run ${cancelled ? 'cancelled' : 'failed'}`, 'card-failed');
+  card.append(el('p', 'chat-body', message));
+  const actions = el('div', 'card-actions');
+  actions.append(actionButton('Run again', 'auto-retry', 'nfw-primary'), actionButton('Try a different prompt', 'auto-reset'));
+  card.append(actions);
+  return card;
+}
+
+const OUTCOME_TITLE = {
+  verified_done: 'Finished · the agents report a verified result',
+  not_feasible: 'Not feasible as asked',
+  gave_up: 'The agents gave up · no accepted result',
+};
+
+function autoOutcomeCard(o) {
+  const card = newCard('✳ Autonomous run · finished');
+  card.append(el('h3', 'card-title', OUTCOME_TITLE[o.status] || 'Finished without a recognized outcome'));
+  if (o.status === 'verified_done') {
+    card.append(el('p', 'nfw-muted', 'The speedup and proof are shown only on the Result stage, from the audited result of the final run.'));
+  } else if (o.status === 'not_feasible') {
+    card.append(el('p', 'chat-body', o.reason || 'The analyst did not give a reason.'));
+    if (o.suggestions.length) { card.append(el('h4', 'mini-heading', 'Possible optimizations / alternatives')); card.append(textList(o.suggestions)); }
+  } else {
+    if (o.report) card.append(el('p', 'chat-body', o.report));
+    if (o.attempts.length) { card.append(el('h4', 'mini-heading', 'Attempts')); card.append(textList(o.attempts)); }
+    if (o.runs.length) { card.append(el('h4', 'mini-heading', 'Runs')); card.append(textList(o.runs.map((run) => `${run.label} · ${run.state}`))); }
+    if (o.lastState) card.append(el('p', 'nfw-muted nfw-mono', `Last run state: ${o.lastState}`));
+    card.append(el('p', 'nfw-muted', 'No speedup is claimed.'));
+  }
+  if (o.assumptions.length) { card.append(el('h4', 'mini-heading', 'Assumptions the agent made')); card.append(textList(o.assumptions)); }
+  if (o.status === 'verified_done' && o.report) card.append(codeSection('Agent report', o.report));
+  if (o.cost !== null) card.append(el('p', 'nfw-muted', `Spend reported by the agents: $${o.cost.toFixed(2)}`));
+  if (o.status !== 'verified_done') {
+    const actions = el('div', 'card-actions');
+    if (o.status === 'gave_up') actions.append(actionButton('Run again', 'auto-retry', 'nfw-primary'));
+    actions.append(actionButton('Try a different prompt', 'auto-reset'));
+    card.append(actions);
+  }
+  return card;
+}
+
+function endAuto(job, snapshot) {
+  const a = view.analysis;
+  loadRuns().then(() => { if (!view.run && view.phase === 0) redraw(); });
+  const result = snapshot.result;
+  if (snapshot.status === 'cancelled') {
+    abortReplay(); // the killed run never writes a terminal event; stop following it
+    finishProgress(job, 'Cancelled');
+    a.last = { type: 'cancelled', kind: 'auto' };
+    pushCard(autoFailedCard('The autonomous run was cancelled. Whatever is already on the run ledgers stays recorded; no accepted result is claimed.', true));
+  } else if (snapshot.status !== 'done' || !result || typeof result !== 'object' || Array.isArray(result)) {
+    const message = snapshot.status === 'done' ? 'The autonomous run returned a result this page could not read.' : trimError(snapshot.error);
+    abortReplay();
+    finishProgress(job, 'Failed');
+    a.last = { type: 'failed', kind: 'auto', error: message };
+    pushCard(autoFailedCard(message));
+  } else {
+    const outcome = autoOutcome(result);
+    a.outcome = result;
+    a.last = { type: 'outcome' };
+    if (typeof result.proposal_id === 'string' && result.proposal_id) a.proposalId = result.proposal_id;
+    finishProgress(job, outcome.status ? `Finished · ${outcome.status}` : 'Finished');
+    pushCard(autoOutcomeCard(outcome));
+    const finalId = typeof snapshot.currentRunId === 'string' && AUTO_RUN_ID.test(snapshot.currentRunId) ? snapshot.currentRunId : '';
+    if (finalId && outcome.status !== 'not_feasible') {
+      view.follow = true;
+      if (view.run && view.run.id === finalId) {
+        if (view.run.status !== 'streaming') loadResult(view.run); // still streaming: loadResult runs at its end and sees the job finished
+      } else {
+        job.currentRunId = finalId;
+        replay({ runId: finalId, sessionId: '', kind: 'repo', label: `Final run · ${repoShort(a.repoUrl)}`, state: 'running', startedUtc: null, endedUtc: null, taskId: '', verified: null }, { live: true, auto: true, instant: true });
+      }
+    } else if (view.run && outcome.status !== 'not_feasible') {
+      go(6, true);
+    } else go(1, true);
+  }
+  redraw();
+}
+
 function resetAnalysis() {
   markStale();
   view.analysis = null;
@@ -746,6 +915,10 @@ function requestAnalyze() {
     return;
   }
   error.hidden = true;
+  if (view.mode !== 'manual') {
+    confirmCard(autoConfirmText(repoUrl), 'Start', `Prompt: ${prompt}`, () => startAuto(repoUrl, prompt));
+    return;
+  }
   confirmCard(
     `Analyze ${repoShort(repoUrl)} with the analyst agent? Uses Crusoe credits (capped by the config, about $1 max). Nothing runs on your machine; repo code only ever runs in the Daytona sandbox later, after you approve.`,
     'Analyze',
@@ -754,20 +927,28 @@ function requestAnalyze() {
   );
 }
 
+function beginAnalysisView(repoUrl, prompt, extra = {}) {
+  stop();
+  abortReplay();
+  clearReplayMessages();
+  markStale();
+  view.analysis = { repoUrl, prompt, proposalId: null, last: null, awaiting: false, lastAnswer: '', ...extra };
+  view.run = null;
+  view.follow = true;
+  view.sourceOpen = false;
+  app.querySelector('.history .attachment').textContent = `↗ ${repoShort(repoUrl)}`;
+  app.querySelector('.history .user .chat-body').textContent = prompt;
+  input.value = '';
+}
+
 function startAnalysis(repoUrl, prompt) {
-  return launchJob('analyze', (signal) => adapter.analyze(repoUrl, prompt, signal), () => {
-    stop();
-    abortReplay();
-    clearReplayMessages();
-    markStale();
-    view.analysis = { repoUrl, prompt, proposalId: null, last: null, awaiting: false, lastAnswer: '' };
-    view.run = null;
-    view.follow = true;
-    view.sourceOpen = false;
-    app.querySelector('.history .attachment').textContent = `↗ ${repoShort(repoUrl)}`;
-    app.querySelector('.history .user .chat-body').textContent = prompt;
-    input.value = '';
-  });
+  return launchJob('analyze', (signal) => adapter.analyze(repoUrl, prompt, signal), () => beginAnalysisView(repoUrl, prompt));
+}
+
+const autoConfirmText = (repoUrl) => `Run fully autonomously on ${repoShort(repoUrl)}? The agents will analyze, fix their own proposal if the sandbox rejects it, run, and re-plan up to the configured limits. Spending is capped by auto.max_total_cost_usd in nofreewins.config.json (default $10). No further questions will be asked.`;
+
+function startAuto(repoUrl, prompt) {
+  return launchJob('auto', (signal) => adapter.auto(repoUrl, prompt, signal), () => beginAnalysisView(repoUrl, prompt, { auto: true, outcome: null }));
 }
 
 function retryAnalysis(a) {
@@ -784,6 +965,12 @@ function sendAnswer(a, text) {
 
 function analystChat(text) {
   const a = view.analysis;
+  if (a.auto) {
+    addMessage('agent', jobActive()
+      ? 'The agents are running autonomously and will not ask questions. Use Cancel on the stage to stop them.'
+      : 'This autonomous run has ended. Use the buttons above to run again or try a different prompt.', '✳ Autonomous run');
+    return;
+  }
   if (view.busy || jobActive()) {
     addMessage('agent', 'The analyst is still working. Send your message once it responds.', '✳ Analyst');
     return;
@@ -831,7 +1018,18 @@ function onAction(act, button) {
   }
   if (act === 'cancel-job') { cancelJob(); return; }
   if (!a || view.busy || jobActive()) return;
-  if (act === 'approve') {
+  if (act === 'auto-reset') {
+    abortReplay();
+    clearReplayMessages();
+    view.run = null;
+    resetAnalysis();
+    addMessage('agent', 'Ready for a different prompt. The repo link is still filled in.', '✳ Autonomous run');
+    go(0);
+    input.focus();
+  } else if (act === 'auto-retry') {
+    if (!a.auto) return;
+    confirmCard(autoConfirmText(a.repoUrl), 'Start', `Prompt: ${a.prompt}`, () => startAuto(a.repoUrl, a.prompt));
+  } else if (act === 'approve') {
     if (!a.proposalId) return;
     returnToAnalysis();
     confirmCard(APPROVE_TEXT, 'Approve & run', '', () => launchJob('approve', (signal) => adapter.approve(a.proposalId, signal)));
@@ -1007,6 +1205,9 @@ app.addEventListener('click', (event) => {
     } else startExample();
   } else if (button.hasAttribute('data-act')) {
     onAction(button.dataset.act, button);
+  } else if (button.hasAttribute('data-mode')) {
+    view.mode = button.dataset.mode === 'manual' ? 'manual' : 'auto';
+    redraw();
   } else if (button.hasAttribute('data-example')) {
     startExample();
   } else if (button.hasAttribute('data-renderer')) {

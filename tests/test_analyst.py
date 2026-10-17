@@ -170,7 +170,8 @@ class ProposalTests(AnalystCase):
     def test_prompt_carries_constraints_repo_and_defaults(self):
         self.start([proposal_reply()])
         system, user = (m["content"] for m in self.client.calls[0][2])
-        for needle in ("deterministic", "NO floats", "1 MiB", "0.05 to 1 second", "generate_input",
+        for needle in ("deterministic", "NO floats", "1 MiB", "0.1 to 0.5 second", "600 KB",
+                       "size = number of lines", "EVERY input-handling branch", "generate_input",
                        "JSON object", "not_feasible", "questions"):
             self.assertIn(needle, system)
         self.assertIn(PROMPT, user)
@@ -338,6 +339,164 @@ class QuestionTests(AnalystCase):
         self.assertIn("feedback on the proposal for pkg/csvload.py:load", self.user_text())
         self.assertFalse((self.proposals / "prop1" / "proposal.json").exists())
         self.assertEqual(self.state()["question_rounds"], 0)
+
+
+def assumption_reply(*assumptions, **changes):
+    return proposal_reply(assumptions=list(assumptions) or ["size = number of lines"], **changes)
+
+
+class AutonomousTests(AnalystCase):
+    def test_autonomous_prompt_forbids_questions_and_plain_prompt_does_not(self):
+        self.start([proposal_reply()], autonomous=True)
+        system = self.client.calls[0][2][0]["content"]
+        self.assertIn("AUTONOMOUS MODE", system)
+        self.assertIn("Do NOT reply with status \"questions\"", system)
+        self.start([proposal_reply()])
+        self.assertNotIn("AUTONOMOUS MODE", self.client.calls[0][2][0]["content"])
+
+    def test_assumptions_are_recorded_and_appended_to_the_description_only(self):
+        result = self.start([assumption_reply("the loader means pkg.csvload.load", "ASCII input")],
+                            autonomous=True)
+        self.assertEqual(result["assumptions"], ["the loader means pkg.csvload.load", "ASCII input"])
+        self.assertEqual(self.state()["assumptions"], result["assumptions"])
+        self.assertGreaterEqual(result["cost_usd"], 0)
+        saved = json.loads((self.proposals / "prop1" / "proposal.json").read_text())["proposal"]
+        self.assertNotIn("assumptions", saved)
+        self.assertTrue(saved["description"].startswith("Takes a list of CSV lines"))
+        self.assertTrue(saved["description"].endswith(
+            "Assumptions: the loader means pkg.csvload.load; ASCII input"))
+        self.assertEqual(self.repo_task.validated[-1]["description"], saved["description"])
+
+    def test_long_assumptions_are_trimmed_into_the_description_cap(self):
+        many = [("x" * 299 + str(n)) for n in range(10)]
+        result = self.start([assumption_reply(*many, description="d" * 1900)], autonomous=True)
+        self.assertEqual(len(result["assumptions"]), 10)
+        saved = json.loads((self.proposals / "prop1" / "proposal.json").read_text())["proposal"]
+        self.assertEqual(len(saved["description"]), analyst.MAX_DESCRIPTION_CHARS)
+        reply = analyst.parse_analyst_reply(assumption_reply(*many, "e" * 900, "f"))
+        self.assertEqual(len(reply["assumptions"]), 10)
+        self.assertTrue(all(len(item) <= 300 for item in reply["assumptions"]))
+
+    def test_questions_are_reasked_once_then_a_proposal_is_taken(self):
+        result = self.start([questions_reply("Which loader?"), assumption_reply("picked load()")],
+                            autonomous=True)
+        self.assertEqual(result["status"], "proposal")
+        self.assertEqual(result["assumptions"], ["picked load()"])
+        self.assertIn("Do not ask; choose and record assumptions", self.user_text())
+        self.assertIn("1. Which loader?", self.user_text())
+        self.assertEqual(self.state()["question_rounds"], 1)
+
+    def test_repeated_questions_are_answered_with_best_judgment_until_the_cap(self):
+        script = [questions_reply("q1"), questions_reply("q2"), assumption_reply("guess")]
+        result = self.start(script, autonomous=True)
+        self.assertEqual(result["status"], "proposal")
+        self.assertIn("Use your best judgment and record the assumption.", self.user_text())
+        self.assertEqual(self.state()["question_rounds"], 2)
+        cfg = nfw_config.load_config()
+        cfg["analysis"]["max_question_rounds"] = 2
+        self.ids = iter(["prop2"])
+        result = self.start([questions_reply("q1")] * 3, autonomous=True, cfg=cfg)
+        self.assertEqual((result["status"], result["reason"]), ("not_feasible",
+                                                                "too many open questions"))
+
+    def test_not_feasible_stays_terminal_and_validation_needs_input_is_auto_fixed(self):
+        result = self.start([infeasible_reply()], autonomous=True)
+        self.assertEqual(result["status"], "not_feasible")
+        self.ids = iter(["prop2"])
+        result = self.start([assumption_reply(), assumption_reply(), assumption_reply("fixed")],
+                            validation_errors=["bad generator", "still bad"], autonomous=True)
+        self.assertEqual(result["status"], "proposal")
+        self.assertIn("Fix exactly the validation error", self.user_text())
+
+    def test_assumptions_accumulate_across_a_repair_continuation(self):
+        self.start([assumption_reply("first")], autonomous=True)
+        with mock.patch.object(analyst, "_run_prepare", return_value=(1, "", "baseline too slow")):
+            analyst.approve("prop1", session_id="s1", proposals_root=self.proposals)
+        result = self.cont([assumption_reply("second")], "Prepare failed: baseline too slow",
+                           autonomous=True)
+        self.assertEqual(result["status"], "proposal")
+        self.assertEqual(result["assumptions"], ["first", "second"])
+        self.assertIn("baseline too slow", self.user_text())
+
+    def test_analysis_failure_carries_the_cost(self):
+        budget = Budget(max_attempts=0)
+        with self.assertRaises(analyst.AnalysisFailed) as caught:
+            self.start([proposal_reply()], autonomous=True, budget=budget)
+        self.assertEqual(caught.exception.cost_usd, 0.0)
+
+
+class FailureLogTests(AnalystCase):
+    FAILING = {PRIMARY: [ModelError(f"crusoe HTTP 503 No capacity at {analyst.PROJECT_ROOT}/x"),
+                         "not json at all"],
+               FALLBACK: [ModelError("crusoe HTTP 503 again " + "z" * 400)]}
+
+    def fail(self, answer=None):
+        self.client = FixtureModelClient(self.FAILING)
+        with self.assertRaises(analyst.AnalysisFailed) as caught:
+            if answer is None:
+                self.use_repo_task()
+                analyst.analyze(repo="r", prompt=PROMPT, client=self.client, order=ORDER,
+                                budget=Budget(), proposals_root=self.proposals,
+                                snapshot_root=self.snapshots, new_id=lambda: "prop1")
+            else:
+                analyst.analyze(proposal_id="prop1", answer=answer, client=self.client, order=ORDER,
+                                budget=Budget(), proposals_root=self.proposals)
+        return caught.exception
+
+    def test_failed_attempts_are_saved_sanitized_in_state_history_and_the_exception(self):
+        exc = self.fail()
+        self.assertEqual(exc.proposal_id, "prop1")
+        state = self.state()
+        self.assertEqual(state["status"], "error")
+        self.assertEqual([(a["kind"], a["outcome"]) for a in state["last_attempts"]],
+                         [("primary", "model_error"), ("retry", "malformed"),
+                          ("fallback", "model_error")])
+        self.assertEqual(state["last_attempts"][0]["model_id"], PRIMARY)
+        self.assertEqual(state["last_attempts"][2]["model_id"], FALLBACK)
+        self.assertTrue(all(len(a["detail"]) <= 200 for a in state["last_attempts"]))
+        self.assertIn("crusoe HTTP 503 No capacity at <project>/x", state["last_attempts"][0]["detail"])
+        self.assertNotIn(str(analyst.PROJECT_ROOT), json.dumps(state))
+        self.assertEqual(state["history"][-1]["attempts"], state["last_attempts"])
+        self.assertIn("model_error: crusoe HTTP 503", state["history"][-1]["analysis_error"])
+        self.assertEqual(exc.attempts, state["last_attempts"])
+        self.assertIn("primary model_error: crusoe HTTP 503", exc.summary)
+        self.assertIn("retry malformed", str(exc))
+
+    def test_resume_from_error_reruns_without_duplicating_the_answer(self):
+        self.start([proposal_reply()], autonomous=True)
+        self.fail("use the second column")
+        history = self.state()["history"]
+        self.assertEqual([entry for entry in history if "answer" in entry],
+                         [{"question": "(feedback on the proposal for pkg/csvload.py:load)",
+                           "answer": "use the second column"}])
+        rounds = self.state()["question_rounds"]
+        result = self.cont([proposal_reply()], None, autonomous=True)
+        self.assertEqual(result["status"], "proposal")
+        state = self.state()
+        self.assertEqual(len([e for e in state["history"] if "answer" in e]), 1)
+        self.assertEqual(state["question_rounds"], rounds)
+        self.assertEqual(state["last_attempts"], [])
+        sent = self.user_text()
+        self.assertEqual(sent.count("use the second column"), 1)
+        self.assertNotIn("503", sent)  # infrastructure errors never reach the model
+
+    def test_resume_after_a_failed_first_analysis_uses_the_stored_prompt(self):
+        self.fail()
+        result = self.cont([proposal_reply()], None, autonomous=True)
+        self.assertEqual(result["status"], "proposal")
+        self.assertIn(PROMPT, self.user_text())
+        self.assertEqual([e for e in self.state()["history"] if "answer" in e], [])
+
+    def test_resume_without_an_answer_is_only_allowed_from_error(self):
+        self.start([proposal_reply()])
+        with self.assertRaises(ValueError):
+            self.cont([proposal_reply()], None)
+
+    def test_an_explicit_answer_is_accepted_from_error(self):
+        self.fail()
+        result = self.cont([proposal_reply()], "retry please, any reasonable target")
+        self.assertEqual(result["status"], "proposal")
+        self.assertIn("feedback on the previous result: error", self.user_text())
 
 
 class NotFeasibleTests(AnalystCase):
@@ -628,6 +787,8 @@ class ConfigTests(unittest.TestCase):
                                               "max_tokens_per_call": 8192})
         self.assertEqual(config["repo"], {"include": "full", "timing_size": 40000,
                                           "correctness_sizes": [0, 1, 2, 3, 5, 8, 13, 50, 200, 1000]})
+        self.assertEqual(config["auto"], {"max_prepare_attempts": 3, "max_runs": 2,
+                                          "max_total_cost_usd": 10, "max_analyst_retries": 2})
         self.assertEqual(nfw_config.DEFAULT_CONFIG_PATH, ROOT / "nofreewins.config.json")
 
     def test_bad_values_are_rejected_with_a_clear_message(self):
@@ -648,6 +809,15 @@ class ConfigTests(unittest.TestCase):
             (mutate("analysis", "max_cost_usd", 0), "analysis.max_cost_usd"),
             (mutate("analysis", "max_question_rounds", 0), "max_question_rounds"),
             (mutate("analysis", "max_tokens_per_call", "8192"), "max_tokens_per_call"),
+            (mutate("auto", "max_prepare_attempts", 6), "auto.max_prepare_attempts"),
+            (mutate("auto", "max_prepare_attempts", 0), "auto.max_prepare_attempts"),
+            (mutate("auto", "max_analyst_retries", 5), "auto.max_analyst_retries"),
+            (mutate("auto", "max_analyst_retries", -1), "auto.max_analyst_retries"),
+            (mutate("auto", "max_runs", 4), "auto.max_runs"),
+            (mutate("auto", "max_runs", True), "auto.max_runs"),
+            (mutate("auto", "max_total_cost_usd", 25.5), "auto.max_total_cost_usd"),
+            (mutate("auto", "max_total_cost_usd", 0), "auto.max_total_cost_usd"),
+            ({k: v for k, v in self.good().items() if k != "auto"}, "auto must be an object"),
             (mutate("repo", "include", "everything"), "include"),
             (mutate("repo", "timing_size", 0), "timing_size"),
             (mutate("repo", "correctness_sizes", []), "correctness_sizes"),

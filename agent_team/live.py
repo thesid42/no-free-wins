@@ -247,9 +247,10 @@ def check_live(session_id, *, deadline_seconds=None, max_rounds=None, max_cost_u
 
 def build_live_run(*, session_id, output_dir, deadline_seconds=None, max_rounds=None, max_cost_usd=None,
                    max_tokens=None, client=None, evaluate=None, available_ids=None,
-                   inject_failures=False):
+                   inject_failures=False, extra_summary=None):
     """Return (Orchestrator, info). The output directory is created only after every check passes.
-    Unset settings come from the global config."""
+    Unset settings come from the global config. extra_summary (public text, e.g. lessons from an
+    earlier attempt) is appended to the task summary the planner and workers see."""
     deadline_seconds, max_rounds, max_cost_usd, max_tokens = _run_defaults(
         deadline_seconds, max_rounds, max_cost_usd, max_tokens)
     check_session_id(session_id)
@@ -259,6 +260,8 @@ def build_live_run(*, session_id, output_dir, deadline_seconds=None, max_rounds=
     check_output_dir(output_dir)
     make_preflight(session_id)()  # an unprepared session leaves no run directory (the orchestrator repeats it)
     task_id, task_summary, run_label, task = _task_context(session_id)
+    if extra_summary is not None:
+        task_summary = f"{task_summary}\n\n{extra_summary}"
     if client is None:
         client = CrusoeClient.from_env()
     if available_ids is None:

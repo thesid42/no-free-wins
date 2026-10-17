@@ -1,5 +1,5 @@
 // Client for the local bridge (same origin). Types: see contracts.d.ts.
-// Replay endpoints are read-only. Launch endpoints (analyze, answer, approve) spend credits, so each one
+// Replay endpoints are read-only. Launch endpoints (analyze, answer, approve, auto) spend credits, so each one
 // requires an explicit `confirmSpend: true` that main.js only passes from a user-confirmed action.
 const RUN_ID = /^[A-Za-z0-9._-]{1,128}$/;
 const ARTIFACT_ID = /^[A-Za-z0-9._:-]{1,200}$/;
@@ -164,6 +164,13 @@ export function createAdapter() {
       if (problem) throw new Error(problem);
       if (typeof prompt !== 'string' || !prompt.trim()) throw new Error('Add a prompt for the analyst.');
       return jobId(await post('/api/analyses', { repoUrl, prompt: prompt.trim(), confirmSpend: true }, signal));
+    },
+    /** Autonomous job: analyze, self-repair, run and re-plan with no further questions. One confirmed click covers all of it. */
+    async auto(repoUrl, prompt, signal) {
+      const problem = repoUrlProblem(repoUrl);
+      if (problem) throw new Error(problem);
+      if (typeof prompt !== 'string' || !prompt.trim()) throw new Error('Add a prompt for the agents.');
+      return jobId(await post('/api/auto', { repoUrl, prompt: prompt.trim(), confirmSpend: true }, signal));
     },
     async answer(proposalId, text, signal) {
       if (typeof text !== 'string' || !text.trim()) throw new Error('Write an answer first.');

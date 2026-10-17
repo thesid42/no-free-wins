@@ -21,6 +21,7 @@ MAX_CONFIG_BYTES = 64 * 1024
 MAX_OFFICIAL_COST_USD = 25.0  # PREP section 4: official run budget is at most min($25, remaining)
 MIN_CALL_TOKENS, MAX_CALL_TOKENS = 256, 32768
 MAX_QUESTION_ROUNDS = 20
+MAX_PREPARE_ATTEMPTS, MAX_AUTO_RUNS, MAX_ANALYST_RETRIES = 5, 3, 4
 MAX_TIMING_SIZE = 10_000_000
 MAX_CORRECTNESS_SIZE = 1_000_000
 MAX_CORRECTNESS_SIZES = 64
@@ -74,7 +75,7 @@ def validate_config(config):
     """Return a normalized deep copy of a config dict, or raise ConfigError."""
     if type(config) is not dict:
         raise ConfigError("config must be a JSON object")
-    extra = set(config) - {"models", "run", "analysis", "repo"}
+    extra = set(config) - {"models", "run", "analysis", "repo", "auto"}
     if extra:
         raise ConfigError(f"unknown top-level keys: {', '.join(sorted(extra))}")
     models = _section(config, "models", ROLES)
@@ -83,6 +84,8 @@ def validate_config(config):
     analysis = _section(config, "analysis", ("max_cost_usd", "max_question_rounds",
                                              "max_tokens_per_call"))
     repo = _section(config, "repo", ("include", "timing_size", "correctness_sizes"))
+    auto = _section(config, "auto", ("max_prepare_attempts", "max_runs", "max_total_cost_usd",
+                                      "max_analyst_retries"))
     sizes = repo["correctness_sizes"]
     if type(sizes) is not list or not 1 <= len(sizes) <= MAX_CORRECTNESS_SIZES:
         raise ConfigError(f"repo.correctness_sizes must be a list of 1 to {MAX_CORRECTNESS_SIZES} integers")
@@ -110,7 +113,15 @@ def validate_config(config):
             "include": repo["include"],
             "timing_size": _integer(repo["timing_size"], "repo.timing_size", 1, MAX_TIMING_SIZE),
             "correctness_sizes": [_integer(size, "repo.correctness_sizes entries", 0,
-                                           MAX_CORRECTNESS_SIZE) for size in sizes]}}
+                                           MAX_CORRECTNESS_SIZE) for size in sizes]},
+        "auto": {
+            "max_prepare_attempts": _integer(auto["max_prepare_attempts"], "auto.max_prepare_attempts",
+                                             1, MAX_PREPARE_ATTEMPTS),
+            "max_runs": _integer(auto["max_runs"], "auto.max_runs", 1, MAX_AUTO_RUNS),
+            "max_total_cost_usd": _number(auto["max_total_cost_usd"], "auto.max_total_cost_usd",
+                                          upper=MAX_OFFICIAL_COST_USD),
+            "max_analyst_retries": _integer(auto["max_analyst_retries"], "auto.max_analyst_retries",
+                                            0, MAX_ANALYST_RETRIES)}}
 
 
 def config_path(path=None):

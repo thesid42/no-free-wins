@@ -270,3 +270,16 @@ html,body{margin:0;min-width:320px;background:light-dark(#f7f8fa,#14171e);color-
 #nfw-ui .job-status .nfw-mono{margin-left:auto;font-size:12px;color:var(--nfw-soft)}
 #nfw-ui .nfw-motion .job-status .flow-dots{animation:nfw-typing .7s ease-in-out 40 alternate}
 @media(max-width:440px){#nfw-ui .message.card,#nfw-ui .message.confirm-card{padding:12px}#nfw-ui .card-actions button{flex:1 1 auto}}
+#nfw-ui .mode-toggle{display:inline-flex;max-width:100%;border:1px solid var(--nfw-line);background:var(--nfw-paper);border-radius:12px;padding:3px;gap:2px;margin:0 auto 14px}
+#nfw-ui .mode-toggle button{min-height:34px;padding:7px 14px;border-radius:9px;white-space:normal}
+#nfw-ui .mode-toggle button[aria-pressed="true"]{background:var(--nfw-ink);color:var(--nfw-page);font-weight:500}
+#nfw-ui .timeline{list-style:none;margin:8px 0 0;padding:0;font-size:13px;line-height:1.5;text-align:left}
+#nfw-ui .timeline li{display:flex;gap:10px;align-items:flex-start;padding:6px 0}
+#nfw-ui .timeline li+li{border-top:1px solid var(--nfw-line)}
+#nfw-ui .tl-icon{flex:0 0 18px;text-align:center;font-weight:600}
+#nfw-ui .tl-ok .tl-icon{color:var(--nfw-ok)}
+#nfw-ui .tl-failed .tl-icon{color:var(--nfw-bad)}
+#nfw-ui .tl-started .tl-icon{color:var(--nfw-soft)}
+#nfw-ui .tl-body{display:flex;flex-direction:column;min-width:0;overflow-wrap:anywhere}
+#nfw-ui .tl-msg{color:var(--nfw-soft);font-size:12px}
+@media(max-width:440px){#nfw-ui .mode-toggle{display:flex}#nfw-ui .mode-toggle button{flex:1 1 0;padding:7px 8px}}

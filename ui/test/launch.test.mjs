@@ -238,7 +238,9 @@ describe('job lifecycle and the single-job lock', () => {
       assert.equal(queued.phase, 'analyzing');
       assert.equal(queued.endedUtc, null);
       assert.equal(queued.result, null);
-      assert.deepEqual(Object.keys(queued).sort(), ['endedUtc', 'error', 'jobId', 'kind', 'phase', 'proposalId', 'result', 'runId', 'sessionId', 'startedUtc', 'status']);
+      assert.deepEqual(Object.keys(queued).sort(), ['currentRunId', 'endedUtc', 'error', 'jobId', 'kind', 'phase', 'proposalId', 'result', 'runId', 'sessionId', 'sessionPrefix', 'startedUtc', 'status', 'steps']);
+      assert.deepEqual(queued.steps, []);
+      assert.equal(queued.currentRunId, null);
       release();
       const child = await nextChild(runner);
       const running = await untilStatus(port, r.json.jobId, 'running');
@@ -523,6 +525,330 @@ describe('approve discovers the run directory', () => {
       await child.exit(1, { stderr: 'failed before the run started' });
       const job = await untilStatus(api.port, r.json.jobId, 'failed');
       assert.equal(job.runId, null);
+    } finally { await api.close(); }
+  });
+});
+
+// ---- autonomous jobs: `python -m agent_team auto` streams NFW_PROGRESS lines on stderr and ends with one JSON on stdout
+const startAuto = (port, repoUrl = 'examples/textstats', prompt = 'make it faster', extra = {}, headers = {}) => json(port, '/api/auto', { repoUrl, prompt, confirmSpend: true, ...extra }, headers);
+const progress = (step, status, extra = {}) => `NFW_PROGRESS ${JSON.stringify({
+  ts: '2026-10-17T10:00:00Z', step, attempt: null, status, message: `${step} ${status}`, proposal_id: null, session_id: null, run_dir: null, run_id: null, ...extra,
+})}\n`;
+const AUTO_RESULT = {
+  status: 'verified_done', proposal_id: 'prop-auto', assumptions: ['inputs are ASCII'], attempts: [],
+  runs: [{ session_id: 'x-p1', run_dir: 'artifacts/runs/x', run_id: 'r1', state: 'verified_done', median_speedup: 3.1 }],
+  final: { run_dir: 'artifacts/runs/x', state: 'verified_done', ledger_final_sha256: 'a'.repeat(64) }, report: 'done', total_cost_usd: 1.5,
+};
+const autoRunDir = (prefix, n, extra = '') => `${prefix}-p${n}-r1-2026101710${String(n).padStart(2, '0')}00Z${extra}`;
+
+describe('autonomous job (POST /api/auto)', () => {
+  test('202 with jobId and sessionPrefix; argv is fixed and keeps the prompt one value', async () => {
+    await withApi({}, async ({ port, runner }) => {
+      const prompt = '--help $(touch /tmp/x) `id` && "q"\nline2 --session-prefix=evil';
+      const r = await startAuto(port, 'https://github.com/octo/repo@main', prompt);
+      assert.equal(r.status, 202);
+      assert.deepEqual(Object.keys(r.json).sort(), ['jobId', 'sessionPrefix']);
+      assert.match(r.json.jobId, /^job-[0-9a-f]{12}$/);
+      assert.match(r.json.sessionPrefix, /^ui-auto-\d{8}T\d{6}Z-[0-9a-f]{6}$/);
+      await nextChild(runner);
+      const call = runner.calls[0];
+      assert.deepEqual(call.args, ['-m', 'agent_team', 'auto', '--repo=https://github.com/octo/repo@main', `--prompt=${prompt}`, `--session-prefix=${r.json.sessionPrefix}`]);
+      assert.equal(call.args.length, 6);
+      assert.equal(call.file, defaultPython(repoRoot));
+      assert.equal(call.cwd, repoRoot);
+      assert.deepEqual(Object.keys(call).sort(), ['args', 'cwd', 'env', 'file']);
+      const job = await getJob(port, r.json.jobId);
+      assert.equal(job.kind, 'auto');
+      assert.equal(job.sessionPrefix, r.json.sessionPrefix);
+      assert.deepEqual(job.steps, []);
+    });
+  });
+
+  test('confirmSpend must be literally true; repo and prompt are validated like analyses', async () => {
+    await withApi({}, async ({ port, runner }) => {
+      for (const extra of [{ confirmSpend: undefined }, { confirmSpend: false }, { confirmSpend: 'true' }, { confirmSpend: 1 }]) {
+        const r = await startAuto(port, 'examples/textstats', 'x', extra);
+        assert.equal(r.status, 400);
+        assert.match(r.json.error, /^confirm spending/);
+      }
+      for (const url of ['http://github.com/octo/repo', 'https://github.com/octo/..', '-rf', '', 7, null]) {
+        const r = await startAuto(port, url);
+        assert.equal(r.status, 400, String(url));
+        assert.match(r.json.error, /repoUrl/);
+      }
+      for (const prompt of ['', '   ', 'x'.repeat(4001), 5, null, 'bad\0nul']) assert.equal((await startAuto(port, 'examples/textstats', prompt)).status, 400);
+      assert.equal(runner.calls.length, 0);
+      assert.equal((await startAuto(port, 'examples/textstats', 'x'.repeat(4000))).status, 202);
+    });
+  });
+
+  test('wrong methods, cross-origin and bad Host are refused before anything runs', async () => {
+    await withApi({}, async ({ port, runner }) => {
+      for (const method of ['GET', 'PUT', 'DELETE']) {
+        const r = await raw(port, '/api/auto', { method });
+        assert.equal(r.status, 405, method);
+        assert.equal(r.headers.allow, 'POST');
+      }
+      for (const origin of ['http://evil.example', 'null', `http://localhost:${port + 1}`]) assert.equal((await startAuto(port, 'examples/textstats', 'x', {}, { Origin: origin })).status, 403, origin);
+      assert.equal((await startAuto(port, 'examples/textstats', 'x', {}, { Host: 'evil.example' })).status, 403);
+      assert.equal((await raw(port, '/api/auto', { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: '{}' })).status, 415);
+      assert.equal(runner.calls.length, 0);
+      assert.equal((await startAuto(port, 'examples/textstats', 'x', {}, { Origin: `http://127.0.0.1:${port}` })).status, 202);
+    });
+  });
+
+  test('NFW_UI_LAUNCH=0 refuses it', async () => {
+    await withApi({ launch: false }, async ({ port, runner }) => {
+      assert.equal((await startAuto(port)).status, 403);
+      assert.equal(runner.calls.length, 0);
+    });
+  });
+
+  test('single-job lock in both directions, released when the job ends', async () => {
+    await withApi({}, async ({ port, runner }) => {
+      const first = await startAuto(port);
+      const child = await nextChild(runner);
+      for (const r of [await startAuto(port), await analyze(port, 'examples/textstats'), await json(port, '/api/analyses/prop-abc/approve', { confirmSpend: true })]) {
+        assert.equal(r.status, 409);
+        assert.deepEqual(r.json, { error: 'another job is running' });
+      }
+      assert.equal(runner.calls.length, 1);
+      await child.exit(0, { stdout: JSON.stringify(AUTO_RESULT) });
+      await untilStatus(port, first.json.jobId, 'done');
+      const second = await analyze(port, 'examples/textstats');
+      assert.equal(second.status, 202);
+      assert.equal((await startAuto(port)).status, 409); // an analysis now holds the lock
+    });
+  });
+
+  test('NFW_PROGRESS lines become ordered steps as they stream, split across chunks, ignoring everything else', async () => {
+    await withApi({}, async ({ port, runner }) => {
+      const r = await startAuto(port);
+      const child = await nextChild(runner);
+      await untilStatus(port, r.json.jobId, 'running');
+      assert.deepEqual((await getJob(port, r.json.jobId)).steps, []);
+      const line = progress('analyze', 'started', { message: 'Analyzing', proposal_id: 'prop-auto' });
+      child.stderr.write(`plain log line\n${line.slice(0, 20)}`);
+      assert.deepEqual((await getJob(port, r.json.jobId)).steps, []); // half a line is not a step yet
+      child.stderr.write(`${line.slice(20)}${progress('analyze', 'ok', { message: `read ${repoRoot}/x and ${homedir()}/y` })}`);
+      const job = await until(async () => { const j = await getJob(port, r.json.jobId); return j.steps.length === 2 ? j : null; }, 'two steps');
+      assert.deepEqual(job.steps.map((s) => [s.step, s.status]), [['analyze', 'started'], ['analyze', 'ok']]);
+      assert.deepEqual(job.steps[0], { ts: '2026-10-17T10:00:00Z', step: 'analyze', attempt: null, status: 'started', message: 'Analyzing', proposal_id: 'prop-auto', session_id: null, run_dir: null, run_id: null });
+      assert.equal(job.steps[1].message, 'read <project>/x and ~/y');
+      assert.equal(job.proposalId, 'prop-auto');
+      assert.equal(job.phase, 'analyze');
+      child.stderr.write(progress('repair', 'started', { attempt: 1 }) + progress('prepare', 'failed', { attempt: 1, run_dir: `${repoRoot}/artifacts/runs/x` }));
+      const later = await until(async () => { const j = await getJob(port, r.json.jobId); return j.steps.length === 4 ? j : null; }, 'four steps');
+      assert.deepEqual(later.steps.map((s) => [s.step, s.attempt, s.status]), [['analyze', null, 'started'], ['analyze', null, 'ok'], ['repair', 1, 'started'], ['prepare', 1, 'failed']]);
+      assert.equal(later.steps[3].run_dir, '<project>/artifacts/runs/x');
+      await child.exit(1, { stdout: JSON.stringify({ ...AUTO_RESULT, status: 'gave_up' }), stderr: progress('done', 'failed', { message: 'gave up' }).trimEnd() }); // last line has no newline
+      const done = await untilStatus(port, r.json.jobId, 'done');
+      assert.equal(done.steps.at(-1).step, 'done');
+      assert.equal(done.steps.at(-1).status, 'failed');
+    });
+  });
+
+  test('malformed progress lines are ignored safely', async () => {
+    await withApi({}, async ({ port, runner }) => {
+      const r = await startAuto(port);
+      const child = await nextChild(runner);
+      const bad = [
+        'NFW_PROGRESS', 'NFW_PROGRESS ', 'NFW_PROGRESS not json', 'NFW_PROGRESS {"step":', 'NFW_PROGRESS null', 'NFW_PROGRESS []', 'NFW_PROGRESS "analyze"',
+        'NFW_PROGRESS {"step":"nope","status":"ok"}', 'NFW_PROGRESS {"step":"analyze","status":"weird"}', 'NFW_PROGRESS {"step":"analyze"}',
+        'NFW_PROGRESS {"step":"__proto__","status":"ok"}', ' NFW_PROGRESS {"step":"analyze","status":"ok"}', `NFW_PROGRESS {"step":"analyze","status":"ok","message":"${'x'.repeat(20000)}"}`,
+      ];
+      child.stderr.write(`${bad.join('\n')}\n`);
+      child.stderr.write(progress('analyze', 'ok', { attempt: 'one', message: 42, proposal_id: '../../etc', run_id: 'a b', session_id: {}, ts: 7 }));
+      child.stderr.write(`NFW_PROGRESS {"step":"run","status":"started","message":"${'y'.repeat(900)}","attempt":2}\n`);
+      const job = await until(async () => { const j = await getJob(port, r.json.jobId); return j.steps.length === 2 ? j : null; }, 'two valid steps');
+      assert.deepEqual(job.steps[0], { ts: null, step: 'analyze', attempt: null, status: 'ok', message: '', proposal_id: null, session_id: null, run_dir: null, run_id: null });
+      assert.equal(job.steps[1].step, 'run');
+      assert.equal(job.steps[1].attempt, 2);
+      assert.equal(job.steps[1].message.length, 600);
+      assert.equal(job.proposalId, null);
+      child.stderr.write('x'.repeat(40_000)); // an endless line never becomes a step and does not grow without bound
+      child.stderr.write(`\n${progress('done', 'ok')}`);
+      const after = await until(async () => { const j = await getJob(port, r.json.jobId); return j.steps.length === 3 ? j : null; }, 'the step after the long line');
+      assert.equal(after.steps[2].step, 'done');
+    });
+  });
+
+  test('only the last 200 steps are kept', async () => {
+    await withApi({}, async ({ port, runner }) => {
+      const r = await startAuto(port);
+      const child = await nextChild(runner);
+      child.stderr.write(Array.from({ length: 250 }, (_, i) => progress('run', 'started', { attempt: i, message: `m${i}` })).join(''));
+      const job = await until(async () => { const j = await getJob(port, r.json.jobId); return j.steps.at(-1)?.attempt === 249 ? j : null; }, '250 lines');
+      assert.equal(job.steps.length, 200);
+      assert.equal(job.steps[0].attempt, 50);
+    });
+  });
+
+  test('progress lines on the other job kinds are not parsed', async () => {
+    await withApi({}, async ({ port, runner }) => {
+      const r = await analyze(port, 'examples/textstats');
+      const child = await nextChild(runner);
+      await child.exit(1, { stderr: progress('analyze', 'ok') });
+      assert.deepEqual((await untilStatus(port, r.json.jobId, 'failed')).steps, []);
+    });
+  });
+
+  test('status mapping: exit 0, 3 and 1-with-JSON are done; no JSON or another code is failed', async () => {
+    await withApi({}, async ({ port, runner }) => {
+      let count = 0;
+      const run = async (code, stdout, stderr = '') => {
+        const r = await startAuto(port);
+        count += 1;
+        await (await nextChild(runner, count)).exit(code, { stdout, stderr });
+        return untilStatus(port, r.json.jobId, 'done', 'failed');
+      };
+      for (const [code, status] of [[0, 'verified_done'], [3, 'not_feasible'], [1, 'gave_up']]) {
+        const job = await run(code, JSON.stringify({ ...AUTO_RESULT, status }));
+        assert.equal(job.status, 'done', `exit ${code}`);
+        assert.equal(job.result.status, status);
+        assert.equal(job.error, null);
+        assert.equal(job.phase, 'done');
+      }
+      const none = await run(1, '', 'Traceback: boom');
+      assert.equal(none.status, 'failed');
+      assert.equal(none.result, null);
+      assert.match(none.error, /boom/);
+      assert.equal((await run(1, 'not json')).status, 'failed');
+      assert.equal((await run(0, 'not json')).error, 'output was not a JSON object');
+      assert.equal((await run(2, JSON.stringify(AUTO_RESULT))).status, 'failed'); // an unexpected code never counts as an answer
+      assert.equal((await run(null, JSON.stringify(AUTO_RESULT))).status, 'failed');
+    });
+  });
+
+  test('the result is path-sanitized and the final run_dir is used when no run was discovered', async () => {
+    await withApi({}, async ({ port, runner }) => {
+      const r = await startAuto(port);
+      await (await nextChild(runner)).exit(0, { stdout: JSON.stringify({ ...AUTO_RESULT, report: `see ${repoRoot}/artifacts/runs/x and ${homedir()}/z`, final: { run_dir: `${repoRoot}/artifacts/runs/final-dir`, state: 'verified_done' } }) });
+      const job = await untilStatus(port, r.json.jobId, 'done');
+      assert.equal(job.result.report, 'see <project>/artifacts/runs/x and ~/z');
+      assert.equal(job.currentRunId, 'final-dir');
+      assert.equal(job.runId, 'final-dir');
+    });
+  });
+
+  test('cancel: SIGINT escalation, and exit 1 after a cancel is cancelled (not gave_up); exit 0 still wins', async () => {
+    await withApi({ jobOptions: { graceMs: 40 } }, async ({ port, runner }) => {
+      const a = await startAuto(port);
+      const first = await nextChild(runner, 1);
+      await untilStatus(port, a.json.jobId, 'running');
+      first.stderr.write(progress('run', 'started', { attempt: 1 }));
+      const cancel = await raw(port, `/api/jobs/${a.json.jobId}/cancel`, { method: 'POST' });
+      assert.equal(cancel.status, 200);
+      assert.deepEqual(first.signals, ['SIGINT']);
+      await until(() => first.signals.length === 3, 'SIGTERM and SIGKILL');
+      assert.deepEqual(first.signals, ['SIGINT', 'SIGTERM', 'SIGKILL']);
+      await first.exit(1, { stdout: JSON.stringify({ ...AUTO_RESULT, status: 'gave_up' }), stderr: 'KeyboardInterrupt' });
+      const job = await untilStatus(port, a.json.jobId, 'cancelled');
+      assert.equal(job.result, null);
+      assert.equal(job.steps.length, 1);
+
+      const b = await startAuto(port);
+      const second = await nextChild(runner, 2);
+      await raw(port, `/api/jobs/${b.json.jobId}/cancel`, { method: 'POST' });
+      await second.exit(0, { stdout: JSON.stringify(AUTO_RESULT) }); // it finished before the signal landed
+      assert.equal((await untilStatus(port, b.json.jobId, 'done', 'cancelled')).status, 'done');
+    });
+  });
+
+  test('timeout is 120 minutes by default and a timed-out job fails even with a gave_up JSON', async () => {
+    const real = globalThis.setTimeout;
+    const delays = [];
+    globalThis.setTimeout = (fn, ms, ...rest) => { delays.push(ms); return real(fn, ms, ...rest); };
+    try {
+      await withApi({}, async ({ port, runner }) => {
+        const r = await startAuto(port);
+        await (await nextChild(runner)).exit(0, { stdout: JSON.stringify(AUTO_RESULT) });
+        await untilStatus(port, r.json.jobId, 'done');
+      });
+    } finally { globalThis.setTimeout = real; }
+    assert.ok(delays.includes(120 * 60_000));
+    await withApi({ jobOptions: { timeouts: { auto: 40 }, graceMs: 30 } }, async ({ port, runner }) => {
+      const r = await startAuto(port);
+      const child = await nextChild(runner);
+      await until(() => child.signals.length === 1, 'SIGINT after the timeout');
+      await child.exit(1, { stdout: JSON.stringify({ ...AUTO_RESULT, status: 'gave_up' }), stderr: 'KeyboardInterrupt' });
+      const job = await untilStatus(port, r.json.jobId, 'failed');
+      assert.match(job.error, /^timed out after /);
+    });
+  });
+});
+
+describe('autonomous job discovers its runs', () => {
+  test('any ledger whose session starts with <prefix>-p counts; a second run replaces the first', async () => {
+    const runsRoot = makeRunsRoot();
+    addRun(runsRoot, 'older-run', baseEvents({ session: 'dev-other' }));
+    const runner = fakeRunner();
+    const api = await startApi(runsRoot, { runner, jobOptions: { pollMs: 20 } });
+    try {
+      const r = await startAuto(api.port);
+      const { sessionPrefix } = r.json;
+      const child = await nextChild(runner);
+      await untilStatus(api.port, r.json.jobId, 'running');
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      assert.equal((await getJob(api.port, r.json.jobId)).currentRunId, null);
+      // decoys: other prefixes, the bare prefix, and a session that merely contains the prefix
+      writeLedger(runsRoot, 'decoy-a', baseEvents({ session: 'ui-auto-other-p1', terminal: false }));
+      writeLedger(runsRoot, 'decoy-b', baseEvents({ session: sessionPrefix, terminal: false }));
+      writeLedger(runsRoot, 'decoy-c', baseEvents({ session: `x${sessionPrefix}-p1`, terminal: false }));
+      writeLedger(runsRoot, 'decoy-d', baseEvents({ session: `${sessionPrefix}p1`, terminal: false }));
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      assert.equal((await getJob(api.port, r.json.jobId)).currentRunId, null);
+
+      const run1 = autoRunDir(sessionPrefix, 1);
+      writeLedger(runsRoot, run1, baseEvents({ session: `${sessionPrefix}-p1`, terminal: false }).slice(0, 3));
+      const first = await until(async () => { const j = await getJob(api.port, r.json.jobId); return j.currentRunId ? j : null; }, 'run 1');
+      assert.equal(first.currentRunId, run1);
+      assert.equal(first.runId, run1);
+      assert.equal((await raw(api.port, `/api/runs/${first.currentRunId}/result`)).status !== 404, true);
+
+      const run2 = autoRunDir(sessionPrefix, 2);
+      writeLedger(runsRoot, run2, baseEvents({ session: `${sessionPrefix}-p2`, terminal: false }).slice(0, 3));
+      const second = await until(async () => { const j = await getJob(api.port, r.json.jobId); return j.currentRunId === run2 ? j : null; }, 'run 2 replacing run 1');
+      assert.equal(second.runId, run2);
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      assert.equal((await getJob(api.port, r.json.jobId)).currentRunId, run2); // older directories never come back
+      await child.exit(0, { stdout: JSON.stringify(AUTO_RESULT) });
+      const done = await untilStatus(api.port, r.json.jobId, 'done');
+      assert.equal(done.currentRunId, run2);
+    } finally { await api.close(); }
+  });
+
+  test('two runs that appear between polls: the newest by run_started time wins on exit', async () => {
+    const runsRoot = makeRunsRoot();
+    const runner = fakeRunner();
+    const api = await startApi(runsRoot, { runner, jobOptions: { pollMs: 60_000 } });
+    try {
+      const r = await startAuto(api.port);
+      const { sessionPrefix } = r.json;
+      const child = await nextChild(runner);
+      const later = baseEvents({ session: `${sessionPrefix}-p2`, terminal: false }).map((event) => ({ ...event, utc: event.utc.replace('T10:', 'T11:') }));
+      writeLedger(runsRoot, 'aaa-newest-name-first', later); // sorts first by name but started later
+      writeLedger(runsRoot, 'zzz-older-run', baseEvents({ session: `${sessionPrefix}-p1`, terminal: false }));
+      await child.exit(1, { stdout: JSON.stringify({ ...AUTO_RESULT, status: 'gave_up' }) });
+      const done = await untilStatus(api.port, r.json.jobId, 'done');
+      assert.equal(done.currentRunId, 'aaa-newest-name-first');
+    } finally { await api.close(); }
+  });
+
+  test('runs that predate the job are never matched', async () => {
+    const runsRoot = makeRunsRoot();
+    const runner = fakeRunner();
+    const api = await startApi(runsRoot, { runner, jobOptions: { pollMs: 20 } });
+    try {
+      const r = await startAuto(api.port);
+      const child = await nextChild(runner);
+      const stale = writeLedger(runsRoot, 'stale-dir', baseEvents({ session: `${r.json.sessionPrefix}-p1`, terminal: false }));
+      const old = new Date(Date.now() - 3600_000);
+      utimesSync(dirname(stale), old, old);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      await child.exit(1, { stderr: 'failed before any run' });
+      const job = await untilStatus(api.port, r.json.jobId, 'failed');
+      assert.equal(job.currentRunId, null);
     } finally { await api.close(); }
   });
 });

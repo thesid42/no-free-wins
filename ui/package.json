@@ -9,7 +9,7 @@
   },
   "scripts": {
     "dev": "node server.mjs",
-    "check": "node --check server.mjs && node --check src/main.js && node --check src/adapter.js && node --check src/scenes.js && node --check src/demo-data.js && node --check bridge/api.mjs && node --check bridge/mapping.mjs && node --check bridge/facts.mjs && node --check bridge/chat.mjs && node --check bridge/jobs.mjs && node --check test/helpers.mjs && node --check test/api.test.mjs && node --check test/mapping.test.mjs && node --check test/facts.test.mjs && node --check test/launch.test.mjs",
+    "check": "node --check server.mjs && node --check src/main.js && node --check src/adapter.js && node --check src/scenes.js && node --check src/demo-data.js && node --check bridge/api.mjs && node --check bridge/mapping.mjs && node --check bridge/facts.mjs && node --check bridge/chat.mjs && node --check bridge/jobs.mjs && node --check test/helpers.mjs && node --check test/api.test.mjs && node --check test/mapping.test.mjs && node --check test/facts.test.mjs && node --check test/launch.test.mjs && node --check test/auto_ui.test.mjs",
     "test": "node --test \"test/*.test.mjs\""
   }
 }

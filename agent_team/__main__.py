@@ -1,16 +1,18 @@
 """CLI: python -m agent_team simulate (fully synthetic, never a verified result), models, run,
-analyze (the repo analyst) and approve (prepare the proposal, optionally start the live run)."""
+analyze (the repo analyst), approve (prepare the proposal, optionally start the live run) and auto
+(the whole pipeline unattended)."""
 
 import argparse
 from datetime import datetime, timezone
 import json
 import math
 from pathlib import Path
+import secrets
 import sys
 
 from optimizer_core.ledger import verify_ledger
 
-from . import analyst, contract, live
+from . import analyst, autopilot, contract, live
 from . import config as nfw_config
 from .budget import Budget
 from .calls import ModelOrder
@@ -152,7 +154,7 @@ def run_live(args):
     orchestrator, info = live.build_live_run(
         session_id=args.session_id, output_dir=args.output, deadline_seconds=args.deadline,
         max_rounds=args.max_rounds, max_cost_usd=args.max_cost_usd, max_tokens=args.max_tokens,
-        inject_failures=args.inject_failures)
+        inject_failures=args.inject_failures, extra_summary=getattr(args, "extra_summary", None))
     result = orchestrator.run()
     records = verify_ledger(result.ledger_path)
     summary = {
@@ -212,7 +214,20 @@ def main(argv=None):
     app.add_argument("--session-id", required=True, help="new session id to prepare")
     app.add_argument("--run", action="store_true",
                      help="after a successful prepare, start the live run with the config defaults")
+    aut = commands.add_parser(
+        "auto", help="autonomous pipeline: analyze, prepare (with repair) and run until verified, "
+                     "not feasible or out of budget; no questions, spends money up to auto.max_total_cost_usd")
+    aut.add_argument("--repo", required=True, help="local path or public GitHub URL")
+    aut.add_argument("--prompt", required=True, help="what to optimize, in plain words")
+    aut.add_argument("--session-prefix", default=None,
+                     help="session id prefix (default auto-<UTC time>-<6 hex>)")
+    aut.add_argument("--max-prepare-attempts", type=int, default=None,
+                     help="default: auto.max_prepare_attempts of the config (max 5)")
+    aut.add_argument("--max-runs", type=int, default=None,
+                     help="default: auto.max_runs of the config (max 3)")
     args = parser.parse_args(argv)
+    if args.command == "auto":
+        return main_auto(args)
     if args.command == "run":
         return main_run(args)
     if args.command == "analyze":
@@ -370,6 +385,40 @@ def main_approve(args):
     return main_run(argparse.Namespace(
         session_id=args.session_id, output=None, deadline=None, max_rounds=None, max_cost_usd=None,
         max_tokens=None, inject_failures=False, check=False))
+
+
+AUTO_EXIT_CODES = {"verified_done": 0, "not_feasible": 3, "gave_up": 1}
+
+
+def main_auto(args):
+    """Full autonomy: final JSON on stdout, NFW_PROGRESS lines on stderr. Exit 0 verified_done,
+    3 not_feasible, 1 gave_up or error, 2 usage."""
+    prefix = args.session_prefix
+    if prefix is None:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        prefix = f"auto-{stamp}-{secrets.token_hex(3)}"
+    try:
+        autopilot.check_session_prefix(prefix)
+        if not args.repo.strip():
+            raise ValueError("--repo must not be empty")
+        if not args.prompt.strip() or len(args.prompt) > analyst.MAX_PROMPT_CHARS:
+            raise ValueError(f"--prompt must be 1-{analyst.MAX_PROMPT_CHARS} characters")
+        for flag, value, high in (("--max-prepare-attempts", args.max_prepare_attempts,
+                                   nfw_config.MAX_PREPARE_ATTEMPTS),
+                                  ("--max-runs", args.max_runs, nfw_config.MAX_AUTO_RUNS)):
+            if value is not None and not 1 <= value <= high:
+                raise ValueError(f"{flag} must be an integer from 1 to {high}")
+    except ValueError as exc:
+        return _usage_error(str(exc))
+    try:
+        result = autopilot.run_autopilot(
+            repo=args.repo, prompt=args.prompt, session_prefix=prefix,
+            max_prepare_attempts=args.max_prepare_attempts, max_runs=args.max_runs)
+    except Exception as exc:  # one-line error, never a traceback
+        print(json.dumps(_error(exc)), file=sys.stderr)
+        return 1
+    print(json.dumps(result, indent=2))
+    return AUTO_EXIT_CODES[result["status"]]
 
 
 if __name__ == "__main__":

@@ -22,6 +22,7 @@ const REPO_URL = /^https:\/\/github\.com\/[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{
 const LOCAL_DEMO_REPO = 'examples/textstats';
 const SPEND_ANALYSIS = 'confirm spending: analysis uses Crusoe credits (capped by analysis.max_cost_usd)';
 const SPEND_RUN = 'confirm spending: approving prepares a Daytona sandbox and runs the agents on Crusoe credits (capped by run.max_cost_usd)';
+const SPEND_AUTO = 'confirm spending: an autonomous run analyzes, prepares a Daytona sandbox and runs the agents on Crusoe credits (capped by auto.max_total_cost_usd)';
 const CHAT_MESSAGE_MAX = 2000;
 const MAX_STREAMS = 16;
 const CACHE_MAX = 64;
@@ -274,6 +275,10 @@ export function createApi({
 
   const validText = (value) => typeof value === 'string' && value.trim() !== '' && value.length <= TEXT_MAX && !value.includes('\0');
 
+  const validRepoAndPrompt = (input) => (!validRepoUrl(input.repoUrl)
+    ? `repoUrl must be a public https://github.com/<owner>/<repo> URL (optionally @ref) or ${LOCAL_DEMO_REPO}`
+    : !validText(input.prompt) ? `prompt must be 1-${TEXT_MAX} characters` : null);
+
   /** Start a job from a validated POST; 409 when another job is active. */
   function startJob(res, body, spendMessage, validate, start) {
     if (body.confirmSpend !== true) return fail(res, 400, spendMessage);
@@ -281,7 +286,8 @@ export function createApi({
     if (problem) return fail(res, 400, problem);
     try {
       const job = start(body);
-      send(res, 202, job.kind === 'approve' ? { jobId: job.jobId, sessionId: job.sessionId } : { jobId: job.jobId });
+      send(res, 202, job.kind === 'approve' ? { jobId: job.jobId, sessionId: job.sessionId }
+        : job.kind === 'auto' ? { jobId: job.jobId, sessionPrefix: job.sessionPrefix } : { jobId: job.jobId });
     } catch (error) {
       if (error?.code === 'BUSY') return fail(res, 409, 'another job is running');
       throw error;
@@ -295,10 +301,10 @@ export function createApi({
     if (area === 'jobs') {
       const cancelled = jobs.cancel(a);
       if (!cancelled) fail(res, 404, 'not found'); else send(res, 200, cancelled);
+    } else if (area === 'auto') {
+      startJob(res, body, SPEND_AUTO, validRepoAndPrompt, (input) => jobs.startAuto({ repoUrl: input.repoUrl, prompt: input.prompt }));
     } else if (parts.length === 2) {
-      startJob(res, body, SPEND_ANALYSIS,
-        (input) => (!validRepoUrl(input.repoUrl) ? `repoUrl must be a public https://github.com/<owner>/<repo> URL (optionally @ref) or ${LOCAL_DEMO_REPO}`
-          : !validText(input.prompt) ? `prompt must be 1-${TEXT_MAX} characters` : null),
+      startJob(res, body, SPEND_ANALYSIS, validRepoAndPrompt,
         (input) => jobs.startAnalyze({ repoUrl: input.repoUrl, prompt: input.prompt }));
     } else if (b === 'answer') {
       startJob(res, body, SPEND_ANALYSIS,
@@ -367,6 +373,7 @@ export function createApi({
         return true;
       }
       const isLaunch = (area === 'analyses' && parts.length === 2)
+        || (area === 'auto' && parts.length === 2)
         || (area === 'analyses' && parts.length === 4 && ['answer', 'approve'].includes(b))
         || (area === 'jobs' && parts.length === 4 && b === 'cancel');
       if (method === 'POST' && isLaunch) { await launchRoute(req, res, parts); return true; }
