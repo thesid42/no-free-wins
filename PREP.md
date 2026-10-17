@@ -1,6 +1,10 @@
-# The Optimizer That Can't Cheat — plan, setup and A/B handoff
+# No Free Wins — plan, setup and A/B handoff
 
-Single source of documentation. Updated Friday, October 16, 2026 (PDT).
+Single source of documentation. Preparation baseline: Friday, October 16, 2026 (PDT). Naming and repository setup: October 17, 2026.
+
+Autonomous optimization. Every win verified.
+
+Public repository: [thesid42/no-free-wins](https://github.com/thesid42/no-free-wins). This document contains setup, the A/B interface, validation evidence, and attribution.
 
 Goal: approve one contract, then let two agents optimize a workload, check their results, recover within budgets, and return an auditable receipt. Core target: at least 3x median speedup with a 95% bootstrap CI lower bound of at least 3x, matching outputs on the tested surface. This is not proof of universal equivalence or immunity to cheating.
 
@@ -8,7 +12,7 @@ Goal: approve one contract, then let two agents optimize a workload, check their
 
 Python 3.11+; Windows and macOS use native clients. Execution happens in hosted Linux on Daytona. No WSL required. Crusoe remains the inference provider for B's agents.
 
-The local .env already exists and is ignored by Git. Keep the real key only there. These names are supported:
+Copy .env.example to .env on a fresh clone; A's local .env already exists and is ignored by Git. Keep real keys only there. These names are supported:
 
     DAYTONA_API_KEY=<your key>
     DAYTONA_API_URL=https://app.daytona.io/api
@@ -236,4 +240,6 @@ Validation completed October 16:
 
 B's live agents, independent model verifier, full autonomous team run and any Version N+1 study remain B/integration work.
 
-Event changes after Saturday's start: not started. List actual paths/features added here, preserving pre-event attribution.
+Repository setup on October 17: preserved the existing preparation files in baseline commit b5e1933, then named the project No Free Wins in PREP.md and pyproject.toml. The commit records when the files entered Git; the prior-work attribution is based on the disclosed preparation history. pre_event_manifest.json remains the original preparation inventory; its PREP.md and pyproject.toml hashes describe the baseline before these naming edits.
+
+Event feature changes after Saturday's start: not started. List actual paths/features added here, preserving pre-event attribution.
