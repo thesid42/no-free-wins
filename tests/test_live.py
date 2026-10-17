@@ -299,7 +299,7 @@ class BuildLiveRunTests(unittest.TestCase):
         for bad in ("../../escaped", "a/b", "/tmp/x", "", "x" * 129, "a b"):
             with self.assertRaises(ValueError, msg=bad):
                 self.build(session_id=bad)
-        for bad in (255, 32769, 8192.0, True, None):
+        for bad in (255, 32769, 8192.0, True):  # None means the config default
             with self.assertRaises(ValueError, msg=repr(bad)):
                 self.build(max_tokens=bad)
         self.assertFalse(self.output.exists())
@@ -420,7 +420,7 @@ class RealEvaluateMarginTests(unittest.TestCase):
 
 class ImportIsolationTests(unittest.TestCase):
     def test_importing_live_loads_no_harness_backend_repo_task_or_daytona(self):
-        code = ("import sys, agent_team.live, agent_team.__main__\n"
+        code = ("import sys, agent_team.live, agent_team.analyst, agent_team.__main__\n"
                 "bad = [m for m in ('optimizer_core.harness', 'optimizer_core.backend',\n"
                 "                   'optimizer_core.repo_task', 'daytona')\n"
                 "       if m in sys.modules]\n"

@@ -19,10 +19,10 @@ Status as of October 17, 2026:
 | Workload | `logs-parse-v1`: strict parsing and aggregation with a trusted oracle |
 | Acceptance | Correct outputs, 30 timing pairs, at least 3x median speedup and a 95% bootstrap CI lower bound of at least 3x |
 | Evidence | Raw execution proofs, artifact hashes, receipts, audit, and a hash-chain ledger |
-| Local tests | 325 tests passing, including late-response, failed-call usage, repo-input and fault-drill coverage |
+| Local tests | 411 Python tests and 84 UI bridge tests passing (repo input, analyst, fault drill, replay API) |
 | B: agent orchestration | Event-built `agent_team/` state machine, retries/fallback, budgets, official ledger, and live `run` CLI |
 | Live Crusoe agents and independent model verifier | Validated with real Nemotron workers, GLM verifier, and measured Daytona acceptance |
-| Repo input | Event-built development feature; not part of the official result |
+| Repo input | Event-built development feature: `repo-dev-1` on `examples/textstats` reached `verified_done` at 8.03× (95% CI 7.76–8.21×, receipt audited); not part of the official result |
 | Shared playbook / regression growth | Placeholder interfaces; learning flow remains pending |
 | Sidecar UI | Standalone local skeleton in `ui/`; scripted chat and pipeline scenes, with backend integration deliberately deferred |
 | Official autonomous run and demo | Official session `official-20261017-3`: `verified_done`, median 3.54x, 95% CI 3.49–3.62x, receipt audit and ledger verified (sessions 1–2 failed on Daytona latency; all disclosed in PREP.md). Demo pending |
@@ -112,13 +112,23 @@ npm run dev
 
 Open `http://127.0.0.1:5173`. Run `npm run check` for JavaScript syntax checks.
 
-**This is a UI skeleton, with integration intentionally deferred.** Links and instructions remain in page memory; URLs are never fetched. Chat replies and pipeline activity are local demonstrations. Downloads use the labeled `dev-live-a-20261017-2` development fixture, unrelated to the submitted link. The two-sandbox scene is proposed; the current backend evaluates candidates sequentially. No model calls, sandbox jobs, or API routes are connected, and the static server serves only an explicit UI file allowlist. `ui/src/contracts.d.ts` outlines a future integration boundary without implementing it.
+**Replay integration (event-built, development).** When `npm run dev` is started from this repository, `ui/server.mjs` also serves a local-only API (127.0.0.1, same-origin, read-only) over this machine's `artifacts/runs/` ledgers: a recorded-runs list, ledger events streamed into the seven scenes, results taken from audited receipts, downloads of the optimized code, original code and proof, and chat answers templated from the run's real data (no model calls). A replay is a recording, not a new run. Launching runs, analyst questions and approval from the UI are not connected yet; the link box only explains this. Without the API the page falls back to the original scripted demo. `npm test` runs the bridge tests.
 
 ## Optimize your own repo (development)
 
-This is an event-built development feature, added after the freeze. It is not part of the official result, and its live validation is pending. The official result remains `official-20261017-3` on frozen commit `b99fc1f`, unchanged.
+This is an event-built development feature, added after the freeze. It is not part of the official result, which remains `official-20261017-3` on frozen commit `b99fc1f`. The spec-file path was validated live on `examples/textstats` (`repo-dev-1`, 8.03×); the analyst path below is pending live validation.
 
-Instead of the built-in `logs-parse-v1` task, point No Free Wins at a small repo (a local path or a public GitHub URL, optionally `@ref`) and name one target function plus an input generator. The agents then try to write a faster `solve(data)` that returns exactly what the target returns.
+**Recommended: describe what you want.** No file is needed in the target repo. An analyst agent reads the repo and your prompt, picks the function, writes an input generator, and proposes optimizations. If something is unclear it asks; if the request can't be optimized safely it says why and suggests alternatives. Nothing runs until you approve.
+
+```sh
+python -m agent_team analyze --repo PATH|https://github.com/owner/name[@ref] --prompt "make the CSV loader faster"
+python -m agent_team analyze --proposal-id P --answer "use load_rows in io/csv.py"
+python -m agent_team approve --proposal-id P --session-id my-repo-dev --run
+```
+
+Models, budgets, run limits and default sizes come from the global `nofreewins.config.json` in this repository; command-line flags override them within the hard caps.
+
+**Alternative: a spec file.** Point No Free Wins at a repo that contains a `nofreewins.json` naming one target function plus an input generator. The agents then try to write a faster `solve(data)` that returns exactly what the target returns.
 
 ```sh
 python -m optimizer_core prepare-repo --session-id my-repo-dev --repo PATH|https://github.com/owner/name[@ref] [--include package|full]

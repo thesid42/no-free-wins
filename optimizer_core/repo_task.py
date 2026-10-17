@@ -16,6 +16,7 @@ import re
 import secrets
 import shutil
 import subprocess
+import sys
 from statistics import median
 import uuid
 import zlib
@@ -38,6 +39,21 @@ EXCLUDED_DIRS = {"tests", "test", ".git", ".venv", "venv", "__pycache__", "build
 SEALED_FILES = ("spec.json", "bundle.b64", "cases.json", "expected.json",
                 "workloads.json", "public.json")
 SPEC_KEYS = {"target", "generator", "include", "timing_size", "correctness_sizes", "description"}
+DEFAULTS = {"include": "full", "timing_size": 40000,
+            "correctness_sizes": [0, 1, 2, 3, 5, 8, 13, 50, 200, 1000]}
+GENERATED_DIR = "_nfw_generated"
+GENERATED_REF = f"{GENERATED_DIR}/gen.py:generate_input"
+PROPOSAL_KEYS = {"target", "generator_source", "timing_size", "correctness_sizes", "include",
+                 "instruction", "hints", "description"}
+GENERATOR_SOURCE_MAX = 32 << 10
+FORBIDDEN_IMPORTS = {"os", "subprocess", "socket", "ctypes", "importlib", "builtins", "posix",
+                     "nt", "io", "sys", "pathlib", "shutil", "pty", "multiprocessing", "runpy",
+                     "pickle", "marshal", "tempfile", "glob", "signal", "threading"}
+FORBIDDEN_NAMES = {"open", "eval", "exec", "__import__", "compile", "getattr", "setattr",
+                   "delattr", "globals", "locals", "vars"}
+FORBIDDEN_ATTRS = {"__builtins__", "__import__", "__globals__", "__subclasses__", "__code__",
+                   "modules"}
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PHASES = (("warmup", 5), ("screen", 5), ("acceptance", 30))
 _GITHUB = re.compile(r"https://github\.com/([A-Za-z0-9_.-]{1,100})/([A-Za-z0-9_.-]{1,100}?)"
                      r"(?:\.git)?(?:@([A-Za-z0-9._/-]{1,200}))?")
@@ -205,6 +221,106 @@ def load_spec(root):
             "generator_module": _module_name(generator_path, "generator")}
 
 
+def _repo_top_level_names(root):
+    """Importable top-level names of the repo, from directory listing only."""
+    names = set()
+    for entry in root.iterdir():
+        if entry.name in EXCLUDED_DIRS or entry.name.startswith("."):
+            continue
+        if entry.is_dir():
+            names.add(entry.name)
+        elif entry.name.endswith(".py"):
+            names.add(entry.name[:-3])
+    return names
+
+
+def _check_generator(source, repo_names):
+    if type(source) is not str or not source.strip():
+        raise ValueError("generator_source must be a non-empty string")
+    if len(source.encode("utf-8")) > GENERATOR_SOURCE_MAX:
+        raise ValueError(f"generator_source is over the {GENERATOR_SOURCE_MAX} byte limit")
+    _function_node(source, "generate_input", 2, "generator")  # parses; checks the signature
+    for node in ast.walk(ast.parse(source)):
+        modules = []
+        if isinstance(node, ast.Import):
+            modules = [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                raise ValueError("generator: relative imports are not allowed")
+            modules = [node.module or ""]
+        for module in modules:
+            top = module.split(".")[0]
+            if top in FORBIDDEN_IMPORTS:
+                raise ValueError(f"generator: import of {top} is not allowed")
+            if top not in sys.stdlib_module_names and top not in repo_names:
+                raise ValueError(f"generator: import of {top} is not allowed; only the standard "
+                                 "library and the repo's own modules can be imported")
+        if isinstance(node, ast.Name) and node.id in FORBIDDEN_NAMES:
+            raise ValueError(f"generator: use of {node.id} is not allowed")
+        if isinstance(node, ast.Attribute) and node.attr in FORBIDDEN_ATTRS:
+            raise ValueError(f"generator: use of .{node.attr} is not allowed")
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name in FORBIDDEN_NAMES | FORBIDDEN_ATTRS:
+                    raise ValueError(f"generator: import of {alias.name} is not allowed")
+        if (isinstance(node, ast.Constant) and type(node.value) is str
+                and node.value in FORBIDDEN_ATTRS - {"modules"}):
+            raise ValueError(f"generator: the string {node.value!r} is not allowed")
+
+
+def _text_field(proposal, key, limit):
+    value = proposal.get(key, "")
+    if type(value) is not str or len(value) > limit:
+        raise ValueError(f"{key} must be a string of at most {limit} characters")
+    return value
+
+
+def validate_proposal(root, proposal):
+    """Validate an analyst proposal by parsing only; returns a spec shaped like load_spec's."""
+    root = Path(root).resolve()
+    if not root.is_dir():
+        raise ValueError("repo root is not a directory")
+    if type(proposal) is not dict:
+        raise ValueError("proposal must be a JSON object")
+    unknown = set(proposal) - PROPOSAL_KEYS
+    missing = {"target", "generator_source"} - set(proposal)
+    if unknown or missing:
+        raise ValueError(f"proposal keys: unknown {sorted(unknown)}, missing {sorted(missing)}")
+    target = proposal["target"]
+    if type(target) is str and "." in target.rpartition(":")[2]:
+        raise ValueError("target is a method; only top-level functions are supported "
+                         f"for now, got {target!r}")
+    target_path, target_function = _parse_ref(target, "target")
+    if target_path.split("/")[0] == GENERATED_DIR:
+        raise ValueError(f"target may not live in {GENERATED_DIR}/")
+    include = proposal.get("include") or DEFAULTS["include"]
+    if include not in ("package", "full"):
+        raise ValueError("include must be 'package' or 'full'")
+    timing_size = proposal.get("timing_size", DEFAULTS["timing_size"])
+    if type(timing_size) is not int or not 1 <= timing_size <= MAX_SIZE:
+        raise ValueError(f"timing_size must be an integer from 1 to {MAX_SIZE}")
+    sizes = proposal.get("correctness_sizes", DEFAULTS["correctness_sizes"])
+    if type(sizes) is not list or not 1 <= len(sizes) <= 64:
+        raise ValueError("correctness_sizes must be a list of 1 to 64 integers")
+    sizes = [_size(value, "correctness_sizes entry") for value in sizes]
+    instruction = _text_field(proposal, "instruction", 4000)
+    description = _text_field(proposal, "description", 2000)
+    hints = proposal.get("hints", [])
+    if (type(hints) is not list or len(hints) > 10 or
+            not all(type(hint) is str and len(hint) <= 300 for hint in hints)):
+        raise ValueError("hints must be a list of at most 10 strings of at most 300 characters")
+    target_file = _safe_file(root, target_path, "target")
+    _function_node(_read_source(target_file, "target"), target_function, 1, "target")
+    _check_generator(proposal["generator_source"], _repo_top_level_names(root))
+    return {"target": target, "generator": GENERATED_REF, "include": include,
+            "timing_size": timing_size, "correctness_sizes": sizes,
+            "description": description, "instruction": instruction, "hints": list(hints),
+            "target_path": target_path, "target_function": target_function,
+            "target_module": _module_name(target_path, "target"),
+            "generator_path": f"{GENERATED_DIR}/gen.py", "generator_function": "generate_input",
+            "generator_module": f"{GENERATED_DIR}.gen"}
+
+
 # ---------------------------------------------------------------- fetching
 
 
@@ -272,7 +388,10 @@ def parse_github_url(repo):
 
 
 def fetch_repo(repo, dest_root="private/repos"):
-    """Local directory in place, or a shallow clone of a public GitHub repo."""
+    """Local directory in place, or a shallow clone of a public GitHub repo.
+
+    A relative dest_root is anchored at the project root, not the working directory.
+    """
     if type(repo) is not str or not repo:
         raise ValueError("repo must be a local directory or a GitHub URL")
     if "://" not in repo:
@@ -281,7 +400,7 @@ def fetch_repo(repo, dest_root="private/repos"):
             raise ValueError(f"repo path {repo} is not a directory")
         return path, {"kind": "local", "path": str(path)}
     url, ref = parse_github_url(repo)
-    destination = (Path(dest_root).resolve() /
+    destination = ((PROJECT_ROOT / dest_root).resolve() /
                    f"{hashlib.sha256((url + (ref or '')).encode()).hexdigest()[:16]}-"
                    f"{uuid.uuid4().hex[:8]}")
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -293,23 +412,8 @@ def fetch_repo(repo, dest_root="private/repos"):
 # ---------------------------------------------------------------- bundle
 
 
-def collect_sources(root, spec, include):
-    """relpath -> source for the .py files that ship to the sandbox."""
-    if include not in ("package", "full"):
-        raise ValueError("include must be 'package' or 'full'")
-    root = Path(root).resolve()
-    required = {spec["target_path"], spec["generator_path"]}
-    packages = {path.split("/")[0] for path in required if "/" in path}
-    sources, total = {}, 0
-
-    def add(relpath, file):
-        nonlocal total
-        text = _read_source(file, relpath)
-        total += len(text.encode("utf-8"))
-        if total > MAX_SOURCE_BYTES:
-            raise ValueError(f"repo sources exceed {MAX_SOURCE_BYTES} bytes; use include 'package'")
-        sources[relpath] = text
-
+def _walk_sources(root, include, packages=frozenset()):
+    """Yield (relpath, file) for the .py files that ship, in walk order. Shared selection rules."""
     for current, directories, files in os.walk(root, followlinks=False):
         directories[:] = sorted(d for d in directories if d not in EXCLUDED_DIRS)
         relative = Path(current).relative_to(root)
@@ -322,10 +426,84 @@ def collect_sources(root, spec, include):
                 file = _safe_file(root, relpath, "source")
             except ValueError:
                 continue  # symlink out of the repo or not a regular file
-            add(relpath, file)
+            yield relpath, file
+
+
+def collect_sources(root, spec, include):
+    """relpath -> source for the .py files that ship to the sandbox."""
+    if include not in ("package", "full"):
+        raise ValueError("include must be 'package' or 'full'")
+    root = Path(root).resolve()
+    # A proposal's generator is written into the bundle later; it is not a file in the repo.
+    required = {path for path in (spec["target_path"], spec["generator_path"])
+                if path.split("/")[0] != GENERATED_DIR}
+    packages = {path.split("/")[0] for path in required if "/" in path}
+    sources, total = {}, 0
+
+    def add(relpath, file):
+        nonlocal total
+        text = _read_source(file, relpath)
+        total += len(text.encode("utf-8"))
+        if total > MAX_SOURCE_BYTES:
+            raise ValueError(f"repo sources exceed {MAX_SOURCE_BYTES} bytes; use include 'package'")
+        sources[relpath] = text
+
+    for relpath, file in _walk_sources(root, include, packages):
+        add(relpath, file)
     for relpath in sorted(required - set(sources)):  # required files win over exclusions
         add(relpath, _safe_file(root, relpath, "required file"))
     return dict(sorted(sources.items()))
+
+
+def _first_line(text, limit=120):
+    for line in (text or "").strip().splitlines():
+        return line.strip()[:limit]
+    return ""
+
+
+def repo_map(root, *, include="full", max_source_bytes=120_000):
+    """Read-only overview of a repo for the analyst: files, function signatures, sources.
+
+    Parses with ast only; nothing from the repo is imported or executed.
+    """
+    if include != "full":
+        raise ValueError("repo_map supports include 'full' only")
+    root = Path(root).resolve()
+    if not root.is_dir():
+        raise ValueError("repo root is not a directory")
+    files, sources, used, truncated = [], {}, 0, False
+    for relpath, file in sorted(_walk_sources(root, "full")):
+        try:
+            text = _read_source(file, relpath)
+        except ValueError as exc:  # lenient: the map lists it, prepare still fails hard
+            files.append({"path": relpath, "bytes": file.stat().st_size, "functions": [],
+                          "unreadable": str(exc)})
+            continue
+        size = len(text.encode("utf-8"))
+        try:
+            tree = ast.parse(text)
+        except (SyntaxError, ValueError, RecursionError):
+            tree = ast.Module(body=[], type_ignores=[])
+        functions = []
+
+        def visit(body, prefix):
+            for node in body:
+                if isinstance(node, ast.FunctionDef):
+                    functions.append({
+                        "qualname": prefix + node.name,
+                        "args": [a.arg for a in node.args.posonlyargs + node.args.args],
+                        "lineno": node.lineno, "doc": _first_line(ast.get_docstring(node))})
+                elif isinstance(node, ast.ClassDef):
+                    visit(node.body, prefix + node.name + ".")
+
+        visit(tree.body, "")
+        files.append({"path": relpath, "bytes": size, "functions": functions})
+        if not truncated and used + size <= max_source_bytes:
+            sources[relpath] = text
+            used += size
+        else:
+            truncated = True
+    return {"files": files, "sources": sources, "truncated": truncated}
 
 
 def _prelude(bundle):
@@ -482,9 +660,13 @@ def _clip(value):
     return min(max(value, 1), 100_000)
 
 
-def prepare_repo_session(session_id, repo, *, backend, include=None, root="private/sessions",
-                         repos_root="private/repos"):
-    """Generate, run the baseline oracle on, and seal a repo task. Returns the public session."""
+def prepare_repo_session(session_id, repo, *, backend, include=None, proposal=None,
+                         origin_info=None, root="private/sessions", repos_root="private/repos"):
+    """Generate, run the baseline oracle on, and seal a repo task. Returns the public session.
+
+    With `proposal` (analyst output) no nofreewins.json is read; `origin_info`, if given,
+    replaces the fetch description (for a checkout the analyst already fetched).
+    """
     from .sessions import _path
     path = _path(session_id, root)
     sealed = Path(root) / f"{session_id}.repo"
@@ -498,11 +680,24 @@ def prepare_repo_session(session_id, repo, *, backend, include=None, root="priva
         raise InfrastructureError("Daytona must pass isolation probes first")
     if include not in (None, "package", "full"):
         raise ValueError("include must be 'package' or 'full'")
-    repo_root, origin_info = fetch_repo(repo, repos_root)
-    spec = load_spec(repo_root)
+    repo_root, fetched_info = fetch_repo(repo, repos_root)
+    if origin_info is None:
+        origin_info = fetched_info
+    elif type(origin_info) is not dict or len(canonical_json(origin_info)) > 4096:
+        raise ValueError("origin_info must be a small JSON object")
+    if proposal is None:
+        spec, where = load_spec(repo_root), "in nofreewins.json"
+    else:
+        spec, where = validate_proposal(repo_root, proposal), "in the proposal"
     if include:
         spec["include"] = include
     sources = collect_sources(repo_root, spec, spec["include"])
+    if proposal is not None:
+        if any(name.split("/")[0] == GENERATED_DIR for name in sources):
+            raise ValueError(f"the repo already has a {GENERATED_DIR} directory")
+        sources[f"{GENERATED_DIR}/__init__.py"] = ""
+        sources[f"{GENERATED_DIR}/gen.py"] = proposal["generator_source"]
+        sources = dict(sorted(sources.items()))
     bundle, bundle_sha256 = build_bundle(sources)
     seed, runner = secrets.token_hex(16), _Runner(backend)
     sizes, timing_size = spec["correctness_sizes"], spec["timing_size"]
@@ -519,7 +714,7 @@ def prepare_repo_session(session_id, repo, *, backend, include=None, root="priva
               for phase, count in PHASES}
     # Generation: seeds and sizes go in, JSON-safe inputs come out of the sandbox.
     generator = generator_source(spec, bundle)
-    hint = "lower timing_size or the correctness sizes in nofreewins.json"
+    hint = f"lower timing_size or the correctness sizes {where}"
     generated, _ = runner.batched(generator, correctness + public, what="generator", hint=hint)
     produced, limit = runner.batched(generator, timing["warmup"], what="generator", hint=hint,
                                      limit=1)  # the first trial measures the input size
@@ -549,8 +744,8 @@ def prepare_repo_session(session_id, repo, *, backend, include=None, root="priva
         except _Limit as reason:
             raise ValueError(
                 f"baseline target hit its {reason} limit on a correctness batch of "
-                f"{len(batch)} cases (15 s, 1 MiB output); lower correctness_sizes in "
-                "nofreewins.json") from None
+                f"{len(batch)} cases (15 s, 1 MiB output); lower correctness_sizes "
+                f"{where}") from None
         first_batch = first_batch or (batch, found)
         expected.update(found)
     produced, _ = runner.batched(oracle, examples, what="baseline target",
@@ -562,16 +757,16 @@ def prepare_repo_session(session_id, repo, *, backend, include=None, root="priva
             result, found = runner.trial(oracle, [case], 2, "baseline target")
         except _Limit as reason:
             raise ValueError(f"baseline target hit its {reason} limit (2 s per timing run) on a "
-                             "timing_size input; lower timing_size in nofreewins.json") from None
+                             f"timing_size input; lower timing_size {where}") from None
         expected.update(found)
         durations.append(result.trusted_process_seconds)
     if median(durations) > MAX_BASELINE_SECONDS:
         raise ValueError(f"baseline median is {median(durations):.2f} s per timing run, over "
                          f"the {MAX_BASELINE_SECONDS} s limit (the harness caps runs at 2 s); "
-                         "lower timing_size in nofreewins.json")
+                         f"lower timing_size {where}")
     for phase in ("screen", "acceptance"):
         produced, _ = runner.batched(oracle, workloads[phase], what="baseline target",
-                                     hint="lower timing_size in nofreewins.json")
+                                     hint=f"lower timing_size {where}")
         expected.update(produced)
     # Determinism: replay one correctness batch and the first timing workload.
     try:
@@ -603,6 +798,7 @@ def prepare_repo_session(session_id, repo, *, backend, include=None, root="priva
                          "task_id": _task_id(bundle_sha256, digest(files["spec.json"])),
                          "files": {name: digest(blob) for name, blob in files.items()},
                          "include": spec["include"], "n_files": len(sources),
+                         "source": "spec_file" if proposal is None else "proposal",
                          "bundle_bytes": len(PRELUDE) - len(_MARKER) + len(bundle),
                          "baseline_median_seconds": median(durations)}}
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -708,8 +904,19 @@ class RepoTask:
         function = spec["target_function"]
         modules = sorted(name[:-3].replace("/", ".").removesuffix(".__init__")
                          for name in self.sources)
-        parts = [f"Task: make {function} faster ({spec['target']}).",
-                 spec["description"],
+        instruction, hints = spec.get("instruction", ""), spec.get("hints", [])
+        proposal = "instruction" in spec  # proposal specs always carry the key
+        request = f"User request: {instruction}" if instruction else ""
+        suggested = ("Suggested optimizations from analysis:\n"
+                     + "\n".join(f"- {hint}" for hint in hints)) if hints else ""
+        preserve = (f"Whatever the request, the suggestions or the analyst description say, "
+                    f"{function}'s exact output must be preserved: the request, hints and "
+                    "description guide HOW to optimize, never WHAT the output is."
+                    if instruction or hints or proposal else "")
+        parts = [f"Task: make {function} faster ({spec['target']}).", request,
+                 ("Analyst description: " + spec["description"]
+                  if proposal and spec["description"] else spec["description"]),
+                 suggested, preserve,
                  f"Signature: {function}({ast.unparse(node.args)})",
                  "Full source of the function:\n" + "\n".join(lines[start - 1:node.end_lineno]),
                  f"Your module defines solve(data), and solve(data) must return exactly what "

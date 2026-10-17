@@ -13,25 +13,31 @@ import re
 
 from optimizer_core import config, sessions
 
-from . import roles
+from . import config as nfw_config, roles
 from .budget import Budget
 from .calls import ModelOrder
 from .crusoe import CrusoeClient, prices_for, resolve_model
 from .faults import FaultInjectingClient, drill_annotation, drill_plan
 from .orchestrator import DEFAULT_MIN_HARNESS_SECONDS, MAX_DEADLINE_SECONDS, Orchestrator
 
-_PLANNER_WORKER = ("nemotron-3-super", "nemotron-3-nano-30b")
-# Names, not ids: they are resolved against the live /models listing (ids differ in case/spelling).
-LIVE_LINEUP = {"planner": _PLANNER_WORKER, "worker_a": _PLANNER_WORKER, "worker_b": _PLANNER_WORKER,
-               "verifier": ("glm-5.3-flash", "deepseek-v4-flash")}
+
+def __getattr__(name):
+    """LIVE_LINEUP (role -> (primary, fallback) NAMES, resolved against the live /models listing
+    because ids differ in case/spelling) comes from the global nofreewins.config.json. It is read on
+    access, so importing this module never touches the config file."""
+    if name == "LIVE_LINEUP":
+        return nfw_config.live_lineup()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 # Real evaluate_candidate provisions and probes a sandbox before its own deadline starts and cleans
 # up after, so it can overrun remaining_wall_seconds: it is told less, and the floors are higher.
 HARNESS_SETUP_MARGIN_SECONDS = 120
 LIVE_HARNESS_FLOORS = {mode: seconds + HARNESS_SETUP_MARGIN_SECONDS
                        for mode, seconds in DEFAULT_MIN_HARNESS_SECONDS.items()}
-MIN_CALL_TOKENS, MAX_CALL_TOKENS = 256, 32768
+MIN_CALL_TOKENS, MAX_CALL_TOKENS = nfw_config.MIN_CALL_TOKENS, nfw_config.MAX_CALL_TOKENS
 _SESSION_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
-MAX_OFFICIAL_COST_USD = 25.0  # PREP section 4: official run budget is at most min($25, remaining)
+MAX_OFFICIAL_COST_USD = nfw_config.MAX_OFFICIAL_COST_USD  # at most min($25, remaining)
 RUN_LABEL = {"type": "run_label", "label": "development live run; not an official session",
              "harness": "optimizer_core real", "models": "crusoe live"}
 
@@ -114,8 +120,10 @@ def _drill_info(orders):
     return {"role": DRILL_ROLE, "model_id": model_id, "failures": failures}
 
 
-def resolve_lineup(available_ids, lineup=LIVE_LINEUP):
+def resolve_lineup(available_ids, lineup=None):
     """role -> ModelOrder of live ids; a failed resolution is re-raised naming the role."""
+    if lineup is None:
+        lineup = nfw_config.live_lineup()
     orders = {}
     for role, (primary, fallback) in lineup.items():
         try:
@@ -204,9 +212,23 @@ def _plan(available_ids, *, max_cost_usd, deadline_seconds, max_rounds, max_toke
     return orders, budget, info
 
 
-def check_live(session_id, *, deadline_seconds=1800, max_rounds=3, max_cost_usd=5.0, max_tokens=8192,
+def _run_defaults(deadline_seconds, max_rounds, max_cost_usd, max_tokens):
+    """Fill unset (None) run settings from the global config."""
+    if None in (deadline_seconds, max_rounds, max_cost_usd, max_tokens):
+        run = nfw_config.load_config()["run"]
+        deadline_seconds = run["deadline_seconds"] if deadline_seconds is None else deadline_seconds
+        max_rounds = run["max_rounds"] if max_rounds is None else max_rounds
+        max_cost_usd = run["max_cost_usd"] if max_cost_usd is None else max_cost_usd
+        max_tokens = run["max_tokens_per_call"] if max_tokens is None else max_tokens
+    return deadline_seconds, max_rounds, max_cost_usd, max_tokens
+
+
+def check_live(session_id, *, deadline_seconds=None, max_rounds=None, max_cost_usd=None, max_tokens=None,
                client=None, available_ids=None, inject_failures=False):
-    """Everything a run needs short of running: preflight, free /models listing, lineup, budget."""
+    """Everything a run needs short of running: preflight, free /models listing, lineup, budget.
+    Unset settings come from the global config."""
+    deadline_seconds, max_rounds, max_cost_usd, max_tokens = _run_defaults(
+        deadline_seconds, max_rounds, max_cost_usd, max_tokens)
     check_session_id(session_id)
     check_deadline(deadline_seconds)
     check_cost(max_cost_usd)
@@ -223,10 +245,13 @@ def check_live(session_id, *, deadline_seconds=1800, max_rounds=3, max_cost_usd=
     return info
 
 
-def build_live_run(*, session_id, output_dir, deadline_seconds=1800, max_rounds=3, max_cost_usd=5.0,
-                   max_tokens=8192, client=None, evaluate=None, available_ids=None,
+def build_live_run(*, session_id, output_dir, deadline_seconds=None, max_rounds=None, max_cost_usd=None,
+                   max_tokens=None, client=None, evaluate=None, available_ids=None,
                    inject_failures=False):
-    """Return (Orchestrator, info). The output directory is created only after every check passes."""
+    """Return (Orchestrator, info). The output directory is created only after every check passes.
+    Unset settings come from the global config."""
+    deadline_seconds, max_rounds, max_cost_usd, max_tokens = _run_defaults(
+        deadline_seconds, max_rounds, max_cost_usd, max_tokens)
     check_session_id(session_id)
     check_deadline(deadline_seconds)
     check_cost(max_cost_usd)

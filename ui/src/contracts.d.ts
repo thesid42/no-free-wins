@@ -12,6 +12,23 @@ export interface PipelineEvent {
   stage: Stage;
   status: 'pending' | 'running' | 'passed' | 'failed' | 'cancelled';
   message: string;
+  /** Replay bridge only: raw ledger event type and its public fields. */
+  kind?: string;
+  detail?: Record<string, unknown>;
+}
+
+/** Replay bridge: one entry of GET /api/runs. */
+export interface RunSummary {
+  runId: string;
+  sessionId: string;
+  kind: 'official' | 'repo' | 'development';
+  label: string;
+  state: string;
+  startedUtc: string | null;
+  endedUtc: string | null;
+  taskId: string;
+  /** true only when the bridge's Python helper verified the ledger; null while not yet checked. */
+  verified: boolean | null;
 }
 
 export interface VerifiedResult {
@@ -29,6 +46,17 @@ export interface VerifiedResult {
   originalArtifactId: string;
   optimizedArtifactId: string;
   proofArtifactId: string;
+}
+
+/** Replay bridge: GET /api/runs/:runId/result. Speedup fields are only meaningful when accepted. */
+export interface ReplayResult extends VerifiedResult {
+  state: string;
+  sessionId: string;
+  label: string | null;
+  ledgerVerified: boolean;
+  ledgerFinalSha256: string | null;
+  taskId: string;
+  candidateId: string | null;
 }
 
 export interface PipelineAdapter {

@@ -1,12 +1,26 @@
-// Local UI controller only. No API client, model calls, source fetching, or sandbox execution.
-// Future controller-facing types live in contracts.d.ts; they are intentionally unimplemented.
+// UI controller. Replays recorded runs through the local read-only bridge (adapter.js) and falls
+// back to the scripted demo when the API is unreachable. No model calls, source fetching, or sandbox execution.
+// Controller-facing types live in contracts.d.ts.
 import { codeBytes, proof, phaseNames, phaseNotes } from './demo-data.js';
 import { render } from './scenes.js';
+import { createAdapter } from './adapter.js';
+
+const adapter = createAdapter();
+const STAGE_PHASE = { analyze: 1, workers: 2, verify: 3, race: 4, zoo: 5, result: 6 };
+const SPEED_PARAM = { 1: 1, 8: 8, instant: 0 };
+const LAUNCH_NOTE = 'Launching from a link is coming next; choose a recorded run.';
+const NOTICE = {
+  checking: 'Checking for the local backend…',
+  up: 'Connected · replaying recorded runs from this machine’s ledgers. A replay is a recording, not a new run. Nothing is launched and links are never fetched.',
+  down: 'Demo mode · local scenes and scripted chat. Backend disconnected. Links are never fetched.',
+};
+const BADGE = { checking: 'Checking backend…', up: 'Connected · replaying recorded runs', down: 'Demo mode · backend disconnected' };
 
 const app = document.querySelector('[data-app="sidecar"]');
 const input = app.querySelector('textarea');
 const source = app.querySelector('input');
 const error = app.querySelector('.source-error');
+const note = app.querySelector('.source-note');
 const conversation = app.querySelector('.conversation-scroll');
 const messages = app.querySelector('.chat-extra');
 const view = {
@@ -16,7 +30,16 @@ const view = {
   playing: false,
   timer: null,
   options: { renderer: 'Line graph' },
+  api: 'checking',
+  runs: [],
+  runsError: '',
+  run: null,
+  speed: 8,
+  follow: true,
+  artifactUrl: adapter.artifactUrl,
 };
+let chatController = null;
+let frame = 0;
 
 function stop() {
   clearTimeout(view.timer);
@@ -27,9 +50,30 @@ function stop() {
 function go(phase, animate = false) {
   view.phase = Math.max(0, Math.min(phaseNames.length - 1, phase));
   if (view.phase > 0) view.sourceOpen = false;
+  cancelAnimationFrame(frame);
+  frame = 0;
   render(view, animate);
 }
 
+function refresh() {
+  if (frame) return;
+  frame = requestAnimationFrame(() => {
+    frame = 0;
+    render(view, false);
+  });
+}
+
+function applyMode() {
+  app.querySelector('.demo-badge').textContent = BADGE[view.api];
+  app.querySelector('.demo-notice').textContent = NOTICE[view.api];
+  app.querySelector('.chat-hint').textContent = view.api === 'up'
+    ? 'Answers come from the recorded run’s data · Enter to send · Shift+Enter for a new line'
+    : 'Local scripted replies · Enter to send · Shift+Enter for a new line';
+  note.textContent = LAUNCH_NOTE;
+  note.hidden = view.api !== 'up';
+}
+
+// ---- demo (scripted) ---------------------------------------------------------------------
 function play() {
   stop();
   view.playing = true;
@@ -47,13 +91,13 @@ function play() {
   view.timer = setTimeout(advance, 2500);
 }
 
-function addMessage(role, text) {
+function addMessage(role, text, speakerText = '✳ No Free Wins · demo', extra = '') {
   const article = document.createElement('article');
-  article.className = `message ${role}`;
+  article.className = `message ${role}${extra ? ` ${extra}` : ''}`;
   if (role === 'agent') {
     const speaker = document.createElement('div');
     speaker.className = 'speaker';
-    speaker.textContent = '✳ No Free Wins · demo';
+    speaker.textContent = speakerText;
     article.append(speaker);
   }
   const body = document.createElement('p');
@@ -64,9 +108,200 @@ function addMessage(role, text) {
   conversation.scrollTop = conversation.scrollHeight;
 }
 
+// ---- recorded-run replay -----------------------------------------------------------------
+const table = () => Object.create(null);
+
+function newRun(meta) {
+  return {
+    id: meta.runId,
+    meta,
+    status: 'streaming',
+    controller: new AbortController(),
+    seen: new Set(),
+    failed: new Set(),
+    terminal: null,
+    result: null,
+    resultState: 'idle',
+    error: '',
+    data: {
+      sessionId: meta.sessionId, models: null, maxRounds: null, deadline: null, label: '', faults: [],
+      strategyIds: [], workers: table(), candidates: table(), screens: table(), verdicts: table(), acceptances: [],
+    },
+  };
+}
+
+function applyEvent(run, event) {
+  const d = run.data;
+  const x = event.detail && typeof event.detail === 'object' ? event.detail : {};
+  const text = (v) => (typeof v === 'string' ? v : undefined);
+  const worker = (key) => (typeof key === 'string' ? (d.workers[key] ||= { attempts: [] }) : null);
+  const candidate = (id) => (typeof id === 'string' ? (d.candidates[id] ||= {}) : null);
+  switch (event.kind) {
+    case 'run_started':
+      d.sessionId = text(x.session_id) || d.sessionId;
+      d.models = x.models && typeof x.models === 'object' ? x.models : null;
+      d.maxRounds = x.max_rounds;
+      d.deadline = x.deadline_seconds;
+      break;
+    case 'run_label':
+      d.label = text(x.label) || d.label;
+      break;
+    case 'fault_injection':
+      if (text(x.label)) d.faults.push(x.label);
+      break;
+    case 'plan':
+      d.strategyIds = Array.isArray(x.strategy_ids) ? x.strategy_ids.map(String) : [];
+      break;
+    case 'worker_order': {
+      const w = worker(x.worker);
+      if (w) Object.assign(w, { strategyId: text(x.strategy_id), primary: x.primary, fallback: x.fallback });
+      break;
+    }
+    case 'candidate_created': {
+      const w = worker(x.worker);
+      const c = candidate(x.candidate_id);
+      if (w && c) {
+        Object.assign(w, { candidateId: x.candidate_id, sha: text(x.candidate_sha256), attempts: Array.isArray(x.attempts) ? x.attempts : [] });
+        w.strategyId = text(x.strategy_id) || w.strategyId;
+        Object.assign(c, { worker: x.worker, sha: w.sha, strategyId: w.strategyId });
+      }
+      break;
+    }
+    case 'screen_result':
+      if (candidate(x.candidate_id)) d.screens[x.candidate_id] = x;
+      break;
+    case 'verifier_verdict':
+      if (candidate(x.candidate_id)) d.verdicts[x.candidate_id] = x;
+      break;
+    case 'acceptance_result':
+      if (candidate(x.candidate_id)) d.acceptances.push(x);
+      break;
+    case 'terminal':
+      run.terminal = x;
+      break;
+    default:
+  }
+}
+
+function abortReplay() {
+  if (view.run) view.run.controller.abort();
+}
+
+function clearReplayMessages() {
+  messages.querySelectorAll('.replay-event').forEach((node) => node.remove());
+}
+
+function onEvent(run, event) {
+  const known = Object.hasOwn(STAGE_PHASE, event.stage);
+  applyEvent(run, event);
+  if (event.kind === 'acceptance_result' && run.resultState === 'idle') fetchResult(run).then(() => { if (view.run === run) refresh(); });
+  if (known) {
+    run.seen.add(event.stage);
+    if (event.status === 'failed') run.failed.add(event.stage);
+  }
+  const message = typeof event.message === 'string' ? event.message.slice(0, 400) : '';
+  if (message) addMessage('agent', message, `✳ Replay · ${known ? event.stage : 'run'}`, 'replay-event');
+  if (view.follow && known && view.phase !== STAGE_PHASE[event.stage]) go(STAGE_PHASE[event.stage], true);
+  else refresh();
+}
+
+function fetchResult(run) {
+  run.resultState = 'loading';
+  run.resultPromise = adapter.result(run.id).then(
+    (result) => { run.result = result; run.resultState = 'ready'; },
+    () => { run.resultState = 'error'; },
+  );
+  return run.resultPromise;
+}
+
+async function loadResult(run) {
+  // Re-fetch at stream end: a result requested at the acceptance event may predate the terminal state.
+  refresh();
+  await run.resultPromise?.catch(() => {});
+  await fetchResult(run);
+  if (view.run !== run) return;
+  if (view.follow && view.phase !== 6) go(6, true);
+  else go(view.phase, false);
+}
+
+async function replay(meta) {
+  abortReplay();
+  stop();
+  chatController?.abort();
+  const run = newRun(meta);
+  view.run = run;
+  view.follow = true;
+  view.sourceOpen = false;
+  error.hidden = true;
+  clearReplayMessages();
+  app.querySelector('.history .attachment').textContent = `↗ Recorded run · ${meta.label || meta.runId}`;
+  app.querySelector('.history .user .chat-body').textContent = `Replay the recorded run ${meta.runId}.`;
+  go(1, true);
+  try {
+    const options = { speed: SPEED_PARAM[view.speed], onEnd: (state) => { run.endState = state; } };
+    for await (const event of adapter.events(meta.runId, run.controller.signal, options)) {
+      if (view.run !== run) return;
+      onEvent(run, event);
+    }
+    if (run.controller.signal.aborted) {
+      if (view.run === run) run.status = 'stopped';
+      refresh();
+      return;
+    }
+    run.status = 'done';
+    await loadResult(run);
+  } catch (failure) {
+    if (view.run !== run || run.controller.signal.aborted) return;
+    run.status = 'error';
+    run.error = failure instanceof Error ? failure.message : 'unknown error';
+    go(view.phase, false);
+  }
+}
+
+async function loadRuns() {
+  try {
+    view.runs = await adapter.runs(AbortSignal.timeout(5000));
+    view.runsError = '';
+  } catch {
+    view.runs = [];
+    view.runsError = 'Could not load the recorded runs list.';
+  }
+}
+
+async function connect() {
+  try {
+    const health = await adapter.health(AbortSignal.timeout(4000));
+    if (health?.ok !== true) throw new Error('Backend not ready');
+    view.api = 'up';
+    await loadRuns();
+  } catch {
+    view.api = 'down';
+  }
+  applyMode();
+  go(view.phase, false);
+}
+
+async function askRun(run, text) {
+  chatController?.abort();
+  const controller = new AbortController();
+  chatController = controller;
+  try {
+    const reply = await adapter.chat(run.id, text, controller.signal);
+    if (view.run === run) addMessage('agent', reply, '✳ No Free Wins · recorded run');
+  } catch {
+    if (controller.signal.aborted) return;
+    addMessage('agent', 'I couldn’t reach the recorded-run chat just now. Nothing about the run changed.', '✳ No Free Wins · recorded run');
+  }
+}
+
 function chat(text) {
   if (!text.trim()) return;
   addMessage('user', text);
+  if (view.run) {
+    input.value = '';
+    askRun(view.run, text.trim());
+    return;
+  }
   let answer;
   if (/\bstop\b|\bpause\b/i.test(text)) {
     stop();
@@ -90,6 +325,9 @@ function chat(text) {
 }
 
 function startExample() {
+  abortReplay();
+  view.run = null;
+  view.follow = true;
   view.sourceOpen = false;
   error.hidden = true;
   source.removeAttribute('aria-invalid');
@@ -99,8 +337,13 @@ function startExample() {
 }
 
 function submitInput() {
-  if (view.phase !== 0) {
+  if (view.run || view.phase !== 0) {
     chat(input.value);
+    return;
+  }
+  if (view.api === 'up') {
+    error.textContent = LAUNCH_NOTE;
+    error.hidden = false;
     return;
   }
   let url;
@@ -146,9 +389,22 @@ app.addEventListener('click', (event) => {
   const button = event.target.closest('button');
   if (!button || !app.contains(button)) return;
   if (button.hasAttribute('data-phase')) {
-    stop();
+    if (view.run) view.follow = false;
+    else stop();
     go(Number(button.dataset.phase), true);
-    app.querySelector(`button[data-phase="${view.phase}"]`).focus({ preventScroll: true });
+  } else if (button.hasAttribute('data-run')) {
+    const meta = view.runs.find((item) => item.runId === button.dataset.run);
+    if (meta) replay(meta);
+  } else if (button.hasAttribute('data-speed')) {
+    view.speed = button.dataset.speed === 'instant' ? 'instant' : Number(button.dataset.speed);
+    if (view.run?.status === 'streaming') replay(view.run.meta);
+    else go(view.phase, false);
+  } else if (button.hasAttribute('data-replay')) {
+    if (view.run.status === 'streaming') {
+      view.run.controller.abort();
+      view.run.status = 'stopped';
+      go(view.phase, false);
+    } else replay(view.run.meta);
   } else if (button.hasAttribute('data-play')) {
     if (view.playing) {
       stop();
@@ -159,7 +415,6 @@ app.addEventListener('click', (event) => {
   } else if (button.hasAttribute('data-renderer')) {
     view.options.renderer = view.options.renderer === 'ASCII' ? 'Line graph' : 'ASCII';
     render(view, false);
-    app.querySelector('[data-renderer]').focus({ preventScroll: true });
   } else if (button.hasAttribute('data-question')) {
     chat(button.dataset.question);
   } else if (button.hasAttribute('data-download')) {
@@ -171,6 +426,10 @@ app.addEventListener('click', (event) => {
     source.focus();
   } else if (button.classList.contains('new-run')) {
     stop();
+    abortReplay();
+    chatController?.abort();
+    view.run = null;
+    view.follow = true;
     view.sourceOpen = true;
     messages.replaceChildren();
     source.value = '';
@@ -178,6 +437,7 @@ app.addEventListener('click', (event) => {
     error.hidden = true;
     source.removeAttribute('aria-invalid');
     go(0);
+    if (view.api === 'up') loadRuns().then(() => { if (!view.run && view.phase === 0) go(0); });
     source.focus();
   }
 });
@@ -192,5 +452,10 @@ input.addEventListener('keydown', (event) => {
     submitInput();
   }
 });
-window.addEventListener('pagehide', stop);
+window.addEventListener('pagehide', () => {
+  stop();
+  abortReplay();
+});
+applyMode();
 render(view, false);
+connect();

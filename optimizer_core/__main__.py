@@ -38,7 +38,44 @@ def demo(output):
             "receipt": str(receipt_path.resolve())}
 
 
-def main():
+def load_proposal_file(path, *, project=None, repos=None):
+    """Read a prepare-repo proposal file; returns (repo, root, origin_info, proposal).
+
+    The root was fetched by the analyst, so it is only checked to exist and to sit inside the
+    project or private/repos (no re-clone, nothing is executed).
+    """
+    try:
+        raw = strict_json(Path(path).read_bytes())
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"proposal file is not readable strict JSON: {exc}") from None
+    if type(raw) is not dict:
+        raise ValueError("proposal file must be a JSON object")
+    unknown = set(raw) - {"repo", "root", "origin_info", "proposal"}
+    missing = {"root", "proposal"} - set(raw)
+    if unknown or missing:
+        raise ValueError(f"proposal file keys: unknown {sorted(unknown)}, missing {sorted(missing)}")
+    if type(raw["root"]) is not str or not raw["root"]:
+        raise ValueError("proposal file root must be a path string")
+    root = Path(raw["root"]).resolve()
+    project = Path(project or Path(__file__).resolve().parents[1]).resolve()
+    allowed = [project, (project / (repos or "private/repos")).resolve()]
+    if not root.is_dir():
+        raise ValueError(f"proposal root {raw['root']} is not a directory")
+    if not any(root.is_relative_to(base) for base in allowed):
+        raise ValueError("proposal root must be inside the project or private/repos")
+    if "repo" in raw and type(raw["repo"]) is not str:
+        raise ValueError("proposal file repo must be a string")
+    origin_info = raw.get("origin_info")
+    if origin_info is None:
+        origin_info = {"kind": "local", "path": str(root)}
+    if type(origin_info) is not dict:
+        raise ValueError("proposal file origin_info must be an object")
+    if type(raw["proposal"]) is not dict:
+        raise ValueError("proposal file proposal must be an object")
+    return raw.get("repo", str(root)), root, origin_info, raw["proposal"]
+
+
+def build_parser():
     parser = argparse.ArgumentParser(description="Disclosed pre-event foundations")
     commands = parser.add_subparsers(dest="command", required=True)
     simulate = commands.add_parser("demo", help="synthetic only; no code/API execution")
@@ -56,7 +93,10 @@ def main():
     prepare_repo = commands.add_parser(
         "prepare-repo", help="seal a repo task (local path or GitHub URL) in the sandbox")
     prepare_repo.add_argument("--session-id", required=True)
-    prepare_repo.add_argument("--repo", required=True, help="local directory or GitHub URL")
+    source = prepare_repo.add_mutually_exclusive_group(required=True)
+    source.add_argument("--repo", help="local directory or GitHub URL with a nofreewins.json")
+    source.add_argument("--proposal", type=Path,
+                        help="analyst proposal JSON ({repo, root, origin_info, proposal})")
     prepare_repo.add_argument("--include", choices=("package", "full"),
                               help="override the include mode in nofreewins.json")
     evaluate_cmd = commands.add_parser("evaluate", help="B-compatible JSON evaluation")
@@ -65,6 +105,11 @@ def main():
                               help="evaluate the known reference as a development calibration")
     evaluate_cmd.add_argument("--session-id")
     evaluate_cmd.add_argument("--mode", choices=("screen", "acceptance"), default="acceptance")
+    return parser
+
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
     if args.command == "demo":
         result = demo(args.output)
@@ -102,9 +147,14 @@ def main():
     elif args.command == "prepare-repo":
         from .backend import verified_backend
         from .repo_task import prepare_repo_session
+        if args.proposal:
+            _, root, origin_info, proposal = load_proposal_file(args.proposal)
+            fields = dict(proposal=proposal, origin_info=origin_info)
+        else:
+            root, fields = args.repo, {}
         with verified_backend() as backend:
-            result = prepare_repo_session(args.session_id, args.repo, backend=backend,
-                                          include=args.include)
+            result = prepare_repo_session(args.session_id, str(root), backend=backend,
+                                          include=args.include, **fields)
         directory = Path("artifacts/commitments")
         directory.mkdir(parents=True, exist_ok=True)
         (directory / (args.session_id + ".json")).write_bytes(canonical_json(result))

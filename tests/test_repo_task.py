@@ -1,4 +1,6 @@
+import contextlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -19,8 +21,9 @@ from optimizer_core.harness import CandidateFailure, Harness
 from optimizer_core.repo_task import (
     REPO_BUNDLE_MAX, RepoTask, baseline_source, build_bundle, collect_sources,
     executed_source, fetch_repo, generator_source, load_spec, parse_github_url,
-    prepare_repo_session)
+    prepare_repo_session, repo_map, validate_proposal)
 from optimizer_core.sessions import load_session
+from optimizer_core import __main__ as cli
 
 EXAMPLE = Path(__file__).resolve().parents[1] / "examples" / "textstats"
 DRIVER = Path(optimizer_core.__file__).with_name("remote_driver.py")
@@ -775,6 +778,567 @@ class TinyRepoTests(unittest.TestCase):
         (repo / "pkg" / "core.py").write_text("#" + "x" * (1 << 20) + "\n")
         with self.assertRaisesRegex(ValueError, "per-file limit"):
             load_spec(repo)
+
+
+GOOD_GENERATOR = """import random
+
+
+def generate_input(seed, size):
+    rng = random.Random(seed)
+    words = ["alpha", "beta", "Gamma", "delta", "eps", "zeta", "eta", "theta"]
+    lines, remaining = [], size
+    while remaining > 0:
+        count = min(remaining, rng.randrange(3, 9))
+        lines.append(" ".join(rng.choice(words) + rng.choice(["", ",", "7"])
+                              for _ in range(count)))
+        remaining -= count
+    return {"lines": lines, "k": 10}
+"""
+
+MAP_FILES = {
+    "pkg/__init__.py": "",
+    "pkg/core.py": ('"""Core."""\n\ndef parse(data, flag):\n    """Parse it.\n\n    More."""\n    return data\n\n'
+                    "class Box:\n    def put(self, item):\n        return item\n\n"
+                    "    class Inner:\n        def deep(self):\n            pass\n"),
+    "pkg/bad.py": "def broken(:\n",
+    "tests/test_x.py": "def test_x():\n    pass\n",
+    "boom.py": "raise SystemExit(3)\n",
+}
+
+
+class RepoMapTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+
+    def test_textstats_example(self):
+        mapped = repo_map(EXAMPLE)
+        paths = [entry["path"] for entry in mapped["files"]]
+        self.assertEqual(paths, sorted(paths))
+        self.assertIn("textstats/core.py", paths)
+        core = next(e for e in mapped["files"] if e["path"] == "textstats/core.py")
+        top = next(f for f in core["functions"] if f["qualname"] == "top_words")
+        self.assertEqual(top["args"], ["data"])
+        self.assertGreater(top["lineno"], 0)
+        self.assertEqual(core["bytes"], len(mapped["sources"]["textstats/core.py"].encode()))
+        self.assertFalse(mapped["truncated"])
+        self.assertEqual(set(mapped["sources"]), set(paths))
+
+    def test_signatures_methods_exclusions_and_no_execution(self):
+        marker = Path(self.directory.name) / "executed"
+        files = dict(MAP_FILES, **{"side.py": f"open({str(marker)!r}, 'w')\n"})
+        write_repo(self.directory.name, files)
+        mapped = repo_map(self.directory.name)
+        by_path = {entry["path"]: entry for entry in mapped["files"]}
+        self.assertNotIn("tests/test_x.py", by_path)
+        self.assertEqual(list(by_path), sorted(by_path))
+        functions = {f["qualname"]: f for f in by_path["pkg/core.py"]["functions"]}
+        self.assertEqual(list(functions), ["parse", "Box.put", "Box.Inner.deep"])
+        self.assertEqual(functions["parse"]["args"], ["data", "flag"])
+        self.assertEqual(functions["parse"]["doc"], "Parse it.")
+        self.assertEqual(functions["parse"]["lineno"], 3)
+        self.assertEqual(functions["Box.put"]["args"], ["self", "item"])
+        self.assertEqual(by_path["pkg/bad.py"]["functions"], [])  # unparsable: listed, no functions
+        self.assertEqual(by_path["boom.py"]["functions"], [])      # SystemExit never ran
+        self.assertFalse(marker.exists())
+
+    def test_doc_is_one_short_line(self):
+        write_repo(self.directory.name, {"m.py": 'def f(x):\n    """' + "a" * 300 + '\n    b"""\n'})
+        mapped = repo_map(self.directory.name)
+        self.assertEqual(len(mapped["files"][0]["functions"][0]["doc"]), 120)
+
+    def test_truncation_keeps_path_order_prefix(self):
+        write_repo(self.directory.name, {"a.py": "x = 1\n" * 10, "b.py": "y = 1\n" * 10,
+                                         "c.py": "z = 1\n"})
+        mapped = repo_map(self.directory.name, max_source_bytes=70)
+        self.assertEqual([e["path"] for e in mapped["files"]], ["a.py", "b.py", "c.py"])
+        self.assertEqual(list(mapped["sources"]), ["a.py"])  # b does not fit; c is not skipped to
+        self.assertTrue(mapped["truncated"])
+        self.assertFalse(repo_map(self.directory.name)["truncated"])
+
+    def test_limits_and_modes(self):
+        write_repo(self.directory.name, BASIC)
+        with self.assertRaises(ValueError):
+            repo_map(self.directory.name, include="package")
+        with self.assertRaises(ValueError):
+            repo_map(Path(self.directory.name) / "missing")
+
+    def test_unreadable_files_are_listed_not_fatal(self):
+        write_repo(self.directory.name, BASIC)
+        pkg = Path(self.directory.name) / "pkg"
+        (pkg / "huge.py").write_text("#" + "x" * (1 << 20))
+        (pkg / "latin.py").write_bytes(b"x = '\xff'\n")
+        mapped = repo_map(self.directory.name)
+        by_path = {entry["path"]: entry for entry in mapped["files"]}
+        self.assertEqual(list(by_path), sorted(by_path))
+        self.assertIn("per-file limit", by_path["pkg/huge.py"]["unreadable"])
+        self.assertIn("UTF-8", by_path["pkg/latin.py"]["unreadable"])
+        for name in ("pkg/huge.py", "pkg/latin.py"):
+            self.assertEqual(by_path[name]["functions"], [])
+            self.assertNotIn(name, mapped["sources"])
+        self.assertNotIn("unreadable", by_path["pkg/core.py"])
+        self.assertIn("pkg/core.py", mapped["sources"])
+        # collect_sources and prepare still fail hard on the same files.
+        with self.assertRaises(ValueError):
+            collect_sources(self.directory.name, load_spec(self.directory.name), "full")
+
+
+class ProposalValidationTests(unittest.TestCase):
+    FILES = {"pkg/__init__.py": "", "pkg/core.py": "def f(data):\n    return data\n\n"
+             "def two(a, b):\n    return a\n\nclass K:\n    def m(self):\n        pass\n",
+             "helper.py": "def make(n):\n    return [n]\n"}
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        write_repo(self.directory.name, self.FILES)
+        (Path(self.directory.name) / "nofreewins.json").unlink()
+
+    def proposal(self, **changes):
+        value = {"target": "pkg/core.py:f", "generator_source": GOOD_GENERATOR,
+                 "timing_size": 100, "correctness_sizes": [0, 1, 5], "include": "package",
+                 "instruction": "make it fast", "hints": ["use a Counter"],
+                 "description": "returns data"}
+        value.update(changes)
+        return value
+
+    def check(self, **changes):
+        return validate_proposal(self.directory.name, self.proposal(**changes))
+
+    def test_good_proposal_has_the_load_spec_shape(self):
+        spec = self.check()
+        self.assertEqual(spec["generator"], "_nfw_generated/gen.py:generate_input")
+        self.assertEqual(spec["target_module"], "pkg.core")
+        self.assertEqual(spec["generator_module"], "_nfw_generated.gen")
+        self.assertEqual((spec["generator_path"], spec["generator_function"]),
+                         ("_nfw_generated/gen.py", "generate_input"))
+        self.assertEqual((spec["timing_size"], spec["correctness_sizes"], spec["include"]),
+                         (100, [0, 1, 5], "package"))
+        self.assertEqual((spec["instruction"], spec["hints"], spec["description"]),
+                         ("make it fast", ["use a Counter"], "returns data"))
+        shape = set(load_spec(EXAMPLE)) | {"instruction", "hints"}
+        self.assertEqual(set(spec), shape)
+
+    def test_defaults_fill_in_omitted_fields(self):
+        proposal = {"target": "pkg/core.py:f", "generator_source": GOOD_GENERATOR}
+        spec = validate_proposal(self.directory.name, proposal)
+        self.assertEqual({key: spec[key] for key in repo_task.DEFAULTS}, repo_task.DEFAULTS)
+        self.assertEqual((spec["instruction"], spec["hints"], spec["description"]), ("", [], ""))
+
+    def test_target_problems(self):
+        for target, message in (("pkg/core.py:absent", "no top-level function"),
+                                ("pkg/core.py:K.m", "method"),
+                                ("pkg/core.py:two", "exactly 1 positional"),
+                                ("pkg/missing.py:f", "not a file"),
+                                ("../x.py:f", "relative"),
+                                ("nocolon", "pkg/mod.py:function"),
+                                ("_nfw_generated/gen.py:f", "_nfw_generated")):
+            with self.assertRaisesRegex(ValueError, message, msg=target):
+                self.check(target=target)
+
+    def test_generator_problems(self):
+        bad = {
+            "import os\ndef generate_input(seed, size):\n    return size\n": "import of os",
+            "import subprocess\ndef generate_input(seed, size):\n    return size\n": "subprocess",
+            "from os import path\ndef generate_input(seed, size):\n    return size\n": "os",
+            "import os.path\ndef generate_input(seed, size):\n    return size\n": "os",
+            "import socket, ctypes\ndef generate_input(seed, size):\n    return size\n": "socket",
+            "import importlib\ndef generate_input(seed, size):\n    return size\n": "importlib",
+            "import builtins\ndef generate_input(seed, size):\n    return size\n": "builtins",
+            "import numpy\ndef generate_input(seed, size):\n    return size\n": "numpy",
+            "from . import x\ndef generate_input(seed, size):\n    return size\n": "relative",
+            "def generate_input(seed, size):\n    return open('x').read()\n": "open",
+            "def generate_input(seed, size):\n    return eval('1')\n": "eval",
+            "def generate_input(seed, size):\n    exec('x=1')\n    return 1\n": "exec",
+            "def generate_input(seed, size):\n    return __import__('os')\n": "__import__",
+            "def generate_input(seed, size):\n    return compile('1', 'x', 'eval')\n": "compile",
+            "def make(seed, size):\n    return size\n": "no top-level function",
+            "def generate_input(seed):\n    return seed\n": "exactly 2 positional",
+            "def generate_input(seed, size, extra):\n    return seed\n": "exactly 2 positional",
+            "def generate_input(seed, size:\n": "does not parse",
+            "": "non-empty",
+        }
+        for source, message in bad.items():
+            with self.assertRaisesRegex(ValueError, message, msg=source):
+                self.check(generator_source=source)
+        with self.assertRaises(ValueError):
+            self.check(generator_source=5)
+
+    def test_generator_bypass_attempts_are_rejected(self):
+        body = "def generate_input(seed, size):\n    return size\n"
+        bad = {
+            "from io import open as o\n" + body: "io",
+            "import posix\n" + body: "posix",
+            "import nt\n" + body: "nt",
+            "import sys\n" + body: "sys",
+            "from sys import modules\n" + body: "sys",
+            "import pathlib\n" + body: "pathlib",
+            "import pickle\n" + body: "pickle",
+            "import threading\n" + body: "threading",
+            "import tempfile\n" + body: "tempfile",
+            "import signal\n" + body: "signal",
+            "import multiprocessing\n" + body: "multiprocessing",
+            "import random\nfrom random import __import__ as q\n" + body: "__import__",
+            "import random\ndef generate_input(seed, size):\n"
+            "    return random.__builtins__['open']\n": "__builtins__",
+            "import random\ndef generate_input(seed, size):\n"
+            "    return getattr(random, '__builtins__')\n": "getattr",
+            "import random\ndef generate_input(seed, size):\n"
+            "    return random.__dict__['_os'].modules\n": "modules",
+            "def generate_input(seed, size):\n    return generate_input.__globals__\n":
+                "__globals__",
+            "def generate_input(seed, size):\n    return generate_input.__code__\n":
+                "__code__",
+            "def generate_input(seed, size):\n    return ().__class__.__subclasses__()\n":
+                "__subclasses__",
+            "def generate_input(seed, size):\n    return globals()\n": "globals",
+            "x = '__builtins__'\n" + body: "__builtins__",
+        }
+        for source, message in bad.items():
+            with self.assertRaisesRegex(ValueError, message, msg=source):
+                self.check(generator_source=source)
+
+    def test_generator_words_that_look_like_names_are_fine(self):
+        source = ("import re\nWORDS = ['open', 'compile', 'modules']\n_R = re.compile('a')\n"
+                  "def generate_input(seed, size):\n    return WORDS[size % 3]\n")
+        self.check(generator_source=source)
+
+    def test_generator_imports_that_are_allowed(self):
+        for source in (GOOD_GENERATOR,
+                       "import random, math, string\nfrom collections import Counter\n"
+                       "def generate_input(seed, size):\n    return size\n",
+                       "import helper\nfrom pkg.core import f\nimport pkg\n"
+                       "def generate_input(seed, size):\n    return helper.make(size)\n"):
+            self.check(generator_source=source)
+
+    def test_generator_oversize(self):
+        source = "# " + "x" * 33_000 + "\ndef generate_input(seed, size):\n    return size\n"
+        with self.assertRaisesRegex(ValueError, "byte limit"):
+            self.check(generator_source=source)
+
+    def test_size_text_and_key_limits(self):
+        for changes in ({"timing_size": 0}, {"timing_size": 10_000_001}, {"timing_size": True},
+                        {"timing_size": 1.5}, {"correctness_sizes": []},
+                        {"correctness_sizes": [1] * 65}, {"correctness_sizes": [-1]},
+                        {"correctness_sizes": [10_000_001]}, {"correctness_sizes": [True]},
+                        {"include": "everything"}, {"instruction": "x" * 4001},
+                        {"instruction": 5}, {"description": "x" * 2001},
+                        {"hints": ["x"] * 11}, {"hints": ["x" * 301]}, {"hints": "one"},
+                        {"hints": [3]}, {"surprise": 1}):
+            with self.assertRaises(ValueError, msg=str(changes)):
+                self.check(**changes)
+        self.check(timing_size=1, correctness_sizes=[0] * 64, instruction="x" * 4000,
+                   description="x" * 2000, hints=["x" * 300] * 10)
+        with self.assertRaises(ValueError):
+            validate_proposal(self.directory.name, {"target": "pkg/core.py:f"})
+        with self.assertRaises(ValueError):
+            validate_proposal(self.directory.name, [])
+
+    def test_validation_never_runs_repo_or_generator_code(self):
+        marker = Path(self.directory.name) / "ran"
+        (Path(self.directory.name) / "pkg" / "core.py").write_text(
+            f"open({str(marker)!r}, 'w')\ndef f(data):\n    return data\n")
+        source = (f"open({str(marker)!r}, 'w')\ndef generate_input(seed, size):\n"
+                  "    return size\n")
+        with self.assertRaisesRegex(ValueError, "open"):
+            self.check(generator_source=source)
+        self.check(generator_source=source.replace("open(", "str(", 1))
+        self.assertFalse(marker.exists())
+
+
+class ProposalSessionTests(unittest.TestCase):
+    """A textstats copy with nofreewins.json deleted, sealed from an analyst proposal."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.directory = tempfile.TemporaryDirectory()
+        base = Path(cls.directory.name)
+        cls.repo = base / "textstats"
+        shutil.copytree(EXAMPLE, cls.repo, ignore=shutil.ignore_patterns("__pycache__"))
+        config = json.loads((cls.repo / "nofreewins.json").read_text())
+        config["timing_size"] = 1500
+        (cls.repo / "nofreewins.json").write_text(json.dumps(config))
+        cls.root = str(base / "sessions")
+        cls.spec_public = prepare_repo_session(
+            "repo-spec", str(cls.repo), backend=LocalSubprocessBackend(), root=cls.root,
+            repos_root=str(base / "repos"))
+        (cls.repo / "nofreewins.json").unlink()
+        cls.proposal = {
+            "target": "textstats/core.py:top_words", "generator_source": GOOD_GENERATOR,
+            "timing_size": 1500, "correctness_sizes": [0, 1, 2, 3, 5, 8, 13, 50, 200],
+            "include": "package", "instruction": "Avoid per-word Python loops.",
+            "hints": ["Use collections.Counter", "Compile the regex once"],
+            "description": "Top k words, case-insensitive."}
+        cls.backend = LocalSubprocessBackend()
+        cls.public = prepare_repo_session(
+            "repo-prop", str(cls.repo), backend=cls.backend, proposal=cls.proposal,
+            origin_info={"kind": "github", "url": "https://github.com/o/n", "commit": "a" * 40},
+            root=cls.root, repos_root=str(base / "repos"))
+        cls.session = load_session("repo-prop", root=cls.root)
+        cls.task = RepoTask.load(cls.session, root=cls.root)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.directory.cleanup()
+
+    def test_sealed_with_generated_sources_and_provenance(self):
+        repo = self.public["repo"]
+        self.assertEqual(repo["source"], "proposal")
+        self.assertEqual(self.spec_public["repo"]["source"], "spec_file")
+        self.assertEqual(repo["origin_info"]["kind"], "github")
+        self.assertEqual(repo["n_files"], 5)  # 3 textstats files + _nfw_generated x2
+        self.assertEqual(self.task.sources["_nfw_generated/gen.py"], GOOD_GENERATOR)
+        self.assertEqual(self.task.sources["_nfw_generated/__init__.py"], "")
+        self.assertEqual(repo["task_id"],
+                         repo_task._task_id(repo["bundle_sha256"], repo["spec_sha256"]))
+        self.assertEqual(self.task.spec["generator"], "_nfw_generated/gen.py:generate_input")
+        self.assertEqual(self.task.spec["instruction"], "Avoid per-word Python loops.")
+        self.assertEqual(self.task.spec["hints"], self.proposal["hints"])
+        self.assertEqual(self.public["workload_lines"], 1500)
+
+    def test_task_id_differs_from_the_spec_file_session(self):
+        self.assertNotEqual(self.public["repo"]["task_id"], self.spec_public["repo"]["task_id"])
+        self.assertNotEqual(self.public["repo"]["bundle_sha256"],
+                            self.spec_public["repo"]["bundle_sha256"])
+
+    def test_task_id_covers_the_instruction_hints_and_generator(self):
+        base = Path(self.directory.name)
+        ids = {self.public["repo"]["task_id"]}
+        for index, changes in enumerate(({"instruction": "different"}, {"hints": []},
+                                         {"generator_source": GOOD_GENERATOR + "# note\n"})):
+            public = prepare_repo_session(
+                f"repo-var{index}", str(self.repo), backend=LocalSubprocessBackend(),
+                proposal={**self.proposal, **changes}, root=self.root,
+                repos_root=str(base / "repos"))
+            ids.add(public["repo"]["task_id"])
+        self.assertEqual(len(ids), 4)
+
+    def test_public_summary_has_request_hints_and_output_guard(self):
+        summary = self.task.public_summary()
+        self.assertIn("User request: Avoid per-word Python loops.", summary)
+        self.assertIn("Suggested optimizations from analysis:\n- Use collections.Counter\n"
+                      "- Compile the regex once", summary)
+        self.assertIn("Analyst description: Top k words, case-insensitive.", summary)
+        self.assertIn("exact output must be preserved", summary)
+        self.assertIn("the request, the suggestions or the analyst description", summary)
+        self.assertIn("never WHAT the output is", summary)
+        self.assertIn("must return exactly what top_words", summary)
+        spec_summary = RepoTask.load(
+            load_session("repo-spec", root=self.root), root=self.root).public_summary()
+        self.assertNotIn("User request", spec_summary)
+        self.assertNotIn("Analyst description", spec_summary)
+
+    def test_generated_inputs_come_from_the_analyst_generator(self):
+        cases = list(self.task.correctness_cases())
+        self.assertEqual(len(cases), 2000)
+        self.assertEqual(cases[0]["input"], {"lines": [], "k": 10})
+        self.assertEqual(self.task.expected_output(cases[0]), [])
+        self.assertTrue(self.task.expected_output(self.task.workload("acceptance", 0)))
+
+    def test_every_trial_went_through_the_backend(self):
+        self.assertTrue(self.backend.calls)
+        self.assertTrue(all(call.trial_id.startswith("prep-") for call in self.backend.calls))
+
+    def test_correct_faster_candidate_passes_the_screen(self):
+        output = tempfile.TemporaryDirectory()
+        self.addCleanup(output.cleanup)
+        harness = Harness(LocalSubprocessBackend(), output=output.name, seed=self.session["seed"],
+                          workload_lines=self.session["workload_lines"], hidden_cases=20,
+                          task=self.task)
+        source = COUNTER_CANDIDATE
+        result = harness.evaluate_candidate({
+            "schema_version": 1, "request_id": "r1", "session_id": "repo-prop",
+            "task_id": self.task.task_id,
+            "candidate": {"candidate_id": "c1", "source_utf8": source.decode(),
+                          "sha256": digest(source)},
+            "mode": "screen", "remaining_wall_seconds": 900,
+            "verifier": {"approved": True, "evidence_ids": ["fixture-verdict"]}})
+        self.assertEqual(result["status"], "screened")
+        self.assertTrue(result["correctness_passed"])
+        wrong = b"def solve(data):\n    return [['zzz', 1]]\n"
+        result = harness.evaluate_candidate({
+            "schema_version": 1, "request_id": "r2", "session_id": "repo-prop",
+            "task_id": self.task.task_id,
+            "candidate": {"candidate_id": "c2", "source_utf8": wrong.decode(),
+                          "sha256": digest(wrong)},
+            "mode": "screen", "remaining_wall_seconds": 900,
+            "verifier": {"approved": True, "evidence_ids": ["fixture-verdict"]}})
+        self.assertEqual(result["status"], "rejected")
+
+    def test_invalid_proposal_is_refused_before_any_trial(self):
+        backend = LocalSubprocessBackend()
+        with self.assertRaisesRegex(ValueError, "import of os"):
+            prepare_repo_session(
+                "repo-bad", str(self.repo), backend=backend, root=self.root,
+                proposal={**self.proposal, "generator_source":
+                          "import os\ndef generate_input(seed, size):\n    return size\n"})
+        self.assertEqual(backend.calls, [])
+        self.assertFalse((Path(self.root) / "repo-bad.repo").exists())
+
+    def test_without_proposal_a_missing_spec_file_is_still_an_error(self):
+        with self.assertRaisesRegex(ValueError, "nofreewins.json"):
+            prepare_repo_session("repo-nospec", str(self.repo), backend=LocalSubprocessBackend(),
+                                 root=self.root)
+
+    def test_repo_with_its_own_generated_dir_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "r"
+            write_repo(repo, dict(BASIC, **{"_nfw_generated/x.py": "X = 1\n"}))
+            (repo / "nofreewins.json").unlink()
+            with self.assertRaisesRegex(ValueError, "_nfw_generated"):
+                prepare_repo_session(
+                    "repo-clash", str(repo), backend=LocalSubprocessBackend(),
+                    proposal={"target": "pkg/core.py:f", "generator_source": GOOD_GENERATOR,
+                              "include": "full"}, root=self.root,
+                    repos_root=str(Path(directory) / "repos"))
+
+
+class CliProposalTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.base = Path(self.directory.name)
+
+    def parse(self, *argv):
+        return cli.build_parser().parse_args(["prepare-repo", *argv])
+
+    def test_parsing_and_mutual_exclusion(self):
+        args = self.parse("--session-id", "s", "--proposal", "p.json", "--include", "full")
+        self.assertEqual((args.proposal, args.repo, args.include), (Path("p.json"), None, "full"))
+        args = self.parse("--session-id", "s", "--repo", "some/dir")
+        self.assertEqual((args.repo, args.proposal), ("some/dir", None))
+        for argv in (["--session-id", "s"],
+                     ["--session-id", "s", "--repo", "r", "--proposal", "p.json"],
+                     ["--repo", "r"]):
+            with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+                self.parse(*argv)
+
+    def write(self, **changes):
+        value = {"repo": "https://github.com/o/n", "root": str(EXAMPLE),
+                 "origin_info": {"kind": "github", "commit": "a" * 40},
+                 "proposal": {"target": "textstats/core.py:top_words",
+                              "generator_source": GOOD_GENERATOR}}
+        value.update(changes)
+        path = self.base / "p.json"
+        path.write_text(json.dumps(value))
+        return path
+
+    def test_proposal_file_is_loaded_and_root_checked(self):
+        repo, root, info, proposal = cli.load_proposal_file(self.write())
+        self.assertEqual((repo, root), ("https://github.com/o/n", EXAMPLE.resolve()))
+        self.assertEqual(info["commit"], "a" * 40)
+        self.assertEqual(proposal["target"], "textstats/core.py:top_words")
+        outside = self.base / "elsewhere"
+        outside.mkdir()
+        with self.assertRaisesRegex(ValueError, "inside the project"):
+            cli.load_proposal_file(self.write(root=str(outside)))
+        with self.assertRaisesRegex(ValueError, "not a directory"):
+            cli.load_proposal_file(self.write(root=str(EXAMPLE / "missing")))
+        # private/repos is also allowed (given explicitly here, as the checkout is a temp dir)
+        repo, root, _, _ = cli.load_proposal_file(self.write(root=str(outside)),
+                                                  repos=self.base, project=EXAMPLE)
+        self.assertEqual(root, outside.resolve())
+        link = self.base / "link"
+        try:
+            link.symlink_to(outside)
+        except (OSError, NotImplementedError):
+            return
+        with self.assertRaisesRegex(ValueError, "inside the project"):
+            cli.load_proposal_file(self.write(root=str(link)), repos=EXAMPLE, project=EXAMPLE)
+
+    def test_default_repos_dir_is_anchored_at_the_project_not_the_cwd(self):
+        project = self.base / "project"
+        (project / "private" / "repos" / "clone").mkdir(parents=True)
+        elsewhere = self.base / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / "private" / "repos").mkdir(parents=True)
+        inside = project / "private" / "repos" / "clone"
+        cwd = os.getcwd()
+        os.chdir(elsewhere)
+        try:
+            self.assertEqual(
+                cli.load_proposal_file(self.write(root=str(inside)), project=project)[1],
+                inside.resolve())
+            with self.assertRaisesRegex(ValueError, "inside the project"):
+                cli.load_proposal_file(
+                    self.write(root=str(elsewhere / "private" / "repos")), project=project)
+        finally:
+            os.chdir(cwd)
+
+    def test_fetch_repo_default_destination_is_anchored_at_the_project(self):
+        project = self.base / "project"
+        project.mkdir()
+        elsewhere = self.base / "elsewhere"
+        elsewhere.mkdir()
+
+        def fake_run(argv, **kwargs):
+            if "clone" in argv:
+                Path(argv[-1]).mkdir(parents=True)
+                return subprocess.CompletedProcess(argv, 0, b"", b"")
+            return subprocess.CompletedProcess(argv, 0, b"a" * 40 + b"\n", b"")
+
+        cwd = os.getcwd()
+        os.chdir(elsewhere)
+        try:
+            with mock.patch.object(subprocess, "run", fake_run), \
+                    mock.patch.object(repo_task, "PROJECT_ROOT", project):
+                path, _ = fetch_repo("https://github.com/o/n")
+        finally:
+            os.chdir(cwd)
+        self.assertEqual(path.parent, (project / "private" / "repos").resolve())
+        self.assertEqual(list(elsewhere.iterdir()), [])
+
+    def test_proposal_file_shape_errors(self):
+        for changes in ({"proposal": []}, {"origin_info": "x"}, {"root": 5}, {"extra": 1},
+                        {"repo": 5}):
+            with self.assertRaises(ValueError, msg=str(changes)):
+                cli.load_proposal_file(self.write(**changes))
+        path = self.base / "q.json"
+        path.write_text("[1]")
+        with self.assertRaises(ValueError):
+            cli.load_proposal_file(path)
+        path.write_text('{"root": "x", "root": "y"}')
+        with self.assertRaises(ValueError):
+            cli.load_proposal_file(path)
+        with self.assertRaises(ValueError):
+            cli.load_proposal_file(self.base / "absent.json")
+        path.write_text(json.dumps({"root": str(EXAMPLE), "proposal": {}}))
+        _, _, info, _ = cli.load_proposal_file(path)  # origin_info defaults to a local record
+        self.assertEqual(info, {"kind": "local", "path": str(EXAMPLE.resolve())})
+
+    def test_main_passes_the_proposal_and_origin_info_through(self):
+        calls = []
+        path = self.write()
+
+        class Backend:
+            def __enter__(self):
+                return "backend"
+
+            def __exit__(self, *exc):
+                return False
+
+        def fake_prepare(session_id, repo, **kwargs):
+            calls.append((session_id, repo, kwargs))
+            return {"session_id": session_id}
+
+        argv = ["optimizer_core", "prepare-repo", "--session-id", "s1", "--proposal", str(path)]
+        cwd = os.getcwd()
+        os.chdir(self.base)  # the commitment file lands in ./artifacts/commitments
+        try:
+            with mock.patch.object(sys, "argv", argv), \
+                    mock.patch("optimizer_core.backend.verified_backend", Backend), \
+                    mock.patch.object(repo_task, "prepare_repo_session", fake_prepare), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                cli.main()
+        finally:
+            os.chdir(cwd)
+        session_id, repo, kwargs = calls[0]
+        self.assertEqual((session_id, repo), ("s1", str(EXAMPLE.resolve())))
+        self.assertEqual(kwargs["backend"], "backend")
+        self.assertEqual(kwargs["origin_info"]["kind"], "github")
+        self.assertEqual(kwargs["proposal"]["target"], "textstats/core.py:top_words")
+        self.assertIsNone(kwargs["include"])
+        self.assertTrue((self.base / "artifacts" / "commitments" / "s1.json").is_file())
 
 
 class LogsPathUnchangedTests(unittest.TestCase):
