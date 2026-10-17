@@ -23,6 +23,7 @@ Status as of October 17, 2026:
 | B: agent orchestration | Event-built `agent_team/` state machine, retries/fallback, budgets, official ledger, and live `run` CLI |
 | Live Crusoe agents and independent model verifier | Validated with real Nemotron workers, GLM verifier, and measured Daytona acceptance |
 | Shared playbook / regression growth | Placeholder interfaces; learning flow remains pending |
+| Sidecar UI | Standalone local skeleton in `ui/`; scripted chat and pipeline scenes, with backend integration deliberately deferred |
 | Official autonomous run and demo | Official session `official-20261017-3`: `verified_done`, median 3.54x, 95% CI 3.49–3.62x, receipt audit and ledger verified (sessions 1–2 failed on Daytona latency; all disclosed in PREP.md). Demo pending |
 
 ### Development evidence
@@ -97,6 +98,21 @@ python -m agent_team run --session-id my-agent-dev --max-cost-usd 1 --max-rounds
 
 `--check` lists models and checks configuration; it makes no inference calls or sandbox allocations. `run` spends Crusoe and Daytona credits, labels itself as development, and returns `verified_done` only after measured acceptance. The inference cap and Daytona budget are separate. Failed requests with unknown usage retain their token/cost reservation; reported usage is recorded even when the final answer is unusable. Late model replies cannot become verdicts, late harness returns cannot become `verified_done`, and cleanup may still finish after the work deadline.
 
+## Sidecar UI preview
+
+The selected interface has chat on the left and a pipeline canvas on the right. The standalone skeleton includes link/instruction input, seven stage views (start, analysis, workers, verification, timing race, cheating zoo, result), replay/pause, an ASCII view, and example code/proof downloads. Chat stays available during replay. Narrow screens stack the pipeline above the conversation; light/dark themes and reduced motion follow system preferences.
+
+Use Node.js 22 or newer on Windows or macOS. No npm dependencies or API keys are needed:
+
+```sh
+cd ui
+npm run dev
+```
+
+Open `http://127.0.0.1:5173`. Run `npm run check` for JavaScript syntax checks.
+
+**This is a UI skeleton, with integration intentionally deferred.** Links and instructions remain in page memory; URLs are never fetched. Chat replies and pipeline activity are local demonstrations. Downloads use the labeled `dev-live-a-20261017-2` development fixture, unrelated to the submitted link. The two-sandbox scene is proposed; the current backend evaluates candidates sequentially. No model calls, sandbox jobs, or API routes are connected, and the static server serves only an explicit UI file allowlist. `ui/src/contracts.d.ts` outlines a future integration boundary without implementing it.
+
 ## What's left
 
 - [x] **B / Anmol:** `agent_team/` orchestration (planner → two distinct workers → screen → verifier → acceptance), bounded primary/retry/fallback, reserve-before-call budgets, deadlines, hash-chained official ledger, and orchestration tests. Built on October 17 with fixture models and a fake harness.
@@ -104,6 +120,7 @@ python -m agent_team run --session-id my-agent-dev --max-cost-usd 1 --max-rounds
 - [x] **B + A:** validate live Crusoe generation and independent verification through measured Daytona acceptance. Both successful and unsuccessful development runs are recorded; retry/fallback and failure paths also have offline regression coverage.
 - [x] **Joint:** wire `optimizer_core.harness.evaluate_candidate` through `agent_team/live.py`, with candidate hashes, verifier evidence, receipts, and one official ledger writer.
 - [ ] **B / joint:** implement the shared playbook and validated regression flow; the current classes are placeholders.
+- [ ] **UI / deferred:** connect source ingestion, live chat, pipeline events, actual artifact delivery, and failure/cancellation states when integration is requested. The Sidecar skeleton currently uses local demo state only.
 - [ ] **A + joint:** validate the merged path, preserve both preparation baselines, freeze the evaluation configuration, and prepare a fresh official session before agents start.
 - [x] **Joint:** complete a live autonomous development run, audit its actual result, verify the official message ledger, and confirm cleanup.
 - [ ] **Joint:** complete the official session and a labeled live recovery drill after injected failures. The recorded successful development run used primary model calls throughout.

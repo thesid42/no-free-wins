@@ -1,0 +1,12 @@
+{
+  "name": "no-free-wins-ui",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Standalone Sidecar UI skeleton. Local demo only; no backend integration.",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "dev": "node server.mjs",
+    "check": "node --check server.mjs && node --check src/main.js && node --check src/scenes.js && node --check src/demo-data.js"
+  }
+}
