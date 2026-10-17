@@ -11,6 +11,7 @@ from optimizer_core.ledger import verify_ledger
 from . import contract
 from .budget import Budget
 from .calls import ModelOrder
+from .crusoe import CrusoeClient, price_per_1k, resolve_model
 from .fake_harness import FakeHarness
 from .models import FixtureModelClient, ModelError
 from .orchestrator import Orchestrator
@@ -120,6 +121,21 @@ def simulate(output, *, inject_failures=False, deadline=900):
         "note": "synthetic simulation; fake harness origin is always synthetic, not a verified result"}
 
 
+def list_models(resolve_names):
+    """Live /models listing with conservative prices; resolved maps NAME -> id or error text."""
+    client = CrusoeClient.from_env()
+    ids = client.list_models()
+    resolved = {}
+    for name in resolve_names:
+        try:
+            resolved[name] = resolve_model(name, ids)
+        except ValueError as exc:
+            resolved[name] = f"error: {exc}"
+    return {"base_url": client.base_url,
+            "models": [{"id": i, "usd_per_1k_conservative": price_per_1k(i)} for i in ids],
+            "resolved": resolved}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="agent_team", description="B orchestration, fixtures only")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -130,7 +146,17 @@ def main(argv=None):
     sim.add_argument("--inject-failures", action="store_true",
                      help="labeled drill: worker_a primary and retry fail, fallback recovers")
     sim.add_argument("--deadline", type=float, default=900, help="wall deadline in seconds")
+    mod = commands.add_parser("models", help="list the models the Crusoe key can see (live call)")
+    mod.add_argument("--resolve", action="append", default=[], metavar="NAME",
+                     help="resolve NAME against the live listing (repeatable)")
     args = parser.parse_args(argv)
+    if args.command == "models":
+        try:
+            print(json.dumps(list_models(args.resolve), indent=2))
+        except (ModelError, ValueError) as exc:
+            print(json.dumps({"error": str(exc)[:300]}), file=sys.stderr)
+            return 1
+        return 0
     if not math.isfinite(args.deadline) or not 0 < args.deadline <= 1800:
         print("--deadline must be greater than 0 and at most 1800 seconds", file=sys.stderr)
         return 2

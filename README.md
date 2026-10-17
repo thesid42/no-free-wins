@@ -19,9 +19,9 @@ Status as of October 17, 2026:
 | Workload | `logs-parse-v1`: strict parsing and aggregation with a trusted oracle |
 | Acceptance | Correct outputs, 30 timing pairs, at least 3x median speedup and a 95% bootstrap CI lower bound of at least 3x |
 | Evidence | Raw execution proofs, artifact hashes, receipts, audit, and a hash-chain ledger |
-| Local tests | 137 tests passing (43 harness + 94 agent orchestration) |
+| Local tests | 176 tests passing (43 harness + 133 agent orchestration and Crusoe adapter) |
 | B: agent orchestration | Event-built `agent_team/` state machine, contract v1 client, fake harness and synthetic `simulate` CLI; fixture models only |
-| Live Crusoe agents and independent model verifier | Pending integration and validation |
+| Live Crusoe agents and independent model verifier | Adapter built and live model listing checked; lineup chosen (verifier `zai-org/GLM-5.3-Flash`); live run pending |
 | Official autonomous run and demo | Pending |
 
 ### Development evidence
@@ -87,7 +87,7 @@ These commands use Daytona credits. `--reference` measures the built-in known so
 ## What's left
 
 - [x] **B / Anmol:** `agent_team/` orchestration (planner → two distinct workers → screen → verifier → acceptance), bounded primary/retry/fallback, reserve-before-call budgets, deadlines, hash-chained official ledger, and orchestration tests. Built on October 17 with fixture models and a fake harness.
-- [ ] **B:** live Crusoe `ModelClient` adapter with per-model prices.
+- [x] **B:** live Crusoe `ModelClient` adapter with per-model prices (`agent_team/crusoe.py`, `python -m agent_team models`).
 - [ ] **B:** validate live Crusoe model access, request/response handling, bounded retries and fallback, attempt/token/cost budgets, and terminal failure paths.
 - [ ] **Joint:** replace B's fake harness with `optimizer_core.harness.evaluate_candidate`; connect candidate hashes, verifier evidence, receipts, and one official ledger writer.
 - [ ] **A + joint:** validate the merged path, preserve both preparation baselines, freeze the evaluation configuration, and prepare a fresh official session before agents start.
