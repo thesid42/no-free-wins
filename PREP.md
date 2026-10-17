@@ -1,6 +1,6 @@
 # No Free Wins — plan, setup and A/B handoff
 
-Single source of documentation. Preparation baseline: Friday, October 16, 2026 (PDT). Naming and repository setup: October 17, 2026.
+Detailed working plan and integration contract. [README.md](README.md) is the project overview with current status and remaining work. Preparation baseline: Friday, October 16, 2026 (PDT). Naming and repository setup: October 17, 2026.
 
 Autonomous optimization. Every win verified.
 
@@ -241,5 +241,7 @@ Validation completed October 16:
 B's live agents, independent model verifier, full autonomous team run and any Version N+1 study remain B/integration work.
 
 Repository setup on October 17: preserved the existing preparation files in baseline commit b5e1933, then named the project No Free Wins in PREP.md and pyproject.toml. The commit records when the files entered Git; the prior-work attribution is based on the disclosed preparation history. pre_event_manifest.json remains the original preparation inventory; its PREP.md and pyproject.toml hashes describe the baseline before these naming edits.
+
+Documentation update on October 17: added README.md with a public project overview, validated preparation status, Windows/macOS setup, team ownership, and a remaining-work checklist. PREP.md remains the detailed plan and interface. This documentation update adds no agent/runtime functionality and does not change the original preparation manifest.
 
 Event feature changes after Saturday's start: not started. List actual paths/features added here, preserving pre-event attribution.
