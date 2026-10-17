@@ -8,11 +8,20 @@ import { promisify } from 'node:util';
 import { buildPresentation, buildProof, buildResult, chatFacts, summarize, verificationOf } from './facts.mjs';
 import { chatReply } from './chat.mjs';
 import { mapEvent } from './mapping.mjs';
+import { createJobs } from './jobs.mjs';
 
 const run = promisify(execFile);
 const here = dirname(fileURLToPath(import.meta.url));
 const RUN_ID = /^[A-Za-z0-9._-]{1,128}$/;
 const CHAT_BODY_MAX = 8 * 1024;
+const LAUNCH_BODY_MAX = 16 * 1024;
+const TEXT_MAX = 4000; // analyst prompt and answer cap
+const PROPOSAL_ID = /^[A-Za-z0-9_-]{1,128}$/;
+const JOB_ID = /^job-[0-9a-f]{12}$/;
+const REPO_URL = /^https:\/\/github\.com\/[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}(\.git)?(@[A-Za-z0-9._/-]{1,100})?$/;
+const LOCAL_DEMO_REPO = 'examples/textstats';
+const SPEND_ANALYSIS = 'confirm spending: analysis uses Crusoe credits (capped by analysis.max_cost_usd)';
+const SPEND_RUN = 'confirm spending: approving prepares a Daytona sandbox and runs the agents on Crusoe credits (capped by run.max_cost_usd)';
 const CHAT_MESSAGE_MAX = 2000;
 const MAX_STREAMS = 16;
 const CACHE_MAX = 64;
@@ -74,7 +83,20 @@ const sleep = (ms, signal) => new Promise((resolve) => {
   signal.addEventListener('abort', done, { once: true });
 });
 
-export function createApi({ repoRoot, runsRoot, python = defaultPython(repoRoot), runsLabel = 'artifacts/runs', sseIdleMs = SSE_IDLE_MS }) {
+/** A GitHub repo URL (optionally @ref) or the one local demo path. "." and ".." segments never name a repo. */
+export function validRepoUrl(value) {
+  if (typeof value !== 'string') return false;
+  if (value === LOCAL_DEMO_REPO) return true;
+  if (!REPO_URL.test(value) || value.includes('..')) return false;
+  const [owner, repo] = value.slice('https://github.com/'.length).split('@')[0].split('/');
+  return ![owner, repo.replace(/\.git$/, '')].some((part) => part === '' || part === '.');
+}
+
+export function createApi({
+  repoRoot, runsRoot, python = defaultPython(repoRoot), runsLabel = 'artifacts/runs', sseIdleMs = SSE_IDLE_MS,
+  runner, launch = process.env.NFW_UI_LAUNCH !== '0', jobOptions = {},
+}) {
+  const jobs = createJobs({ repoRoot, runsRoot, python, runner, ...jobOptions });
   const helper = join(here, 'inspect_run.py');
   const inspectCache = new Cache();
   const summaryCache = new Cache();
@@ -226,9 +248,69 @@ export function createApi({ repoRoot, runsRoot, python = defaultPython(repoRoot)
     } finally { streams -= 1; }
   }
 
-  async function chat(req, res, found) {
+  function sameOrigin(req) {
     const origin = req.headers.origin;
-    if (origin !== undefined && ![`http://127.0.0.1:${req.socket.localPort}`, `http://localhost:${req.socket.localPort}`].includes(origin)) return fail(res, 403, 'cross-origin request refused');
+    return origin === undefined || [`http://127.0.0.1:${req.socket.localPort}`, `http://localhost:${req.socket.localPort}`].includes(origin);
+  }
+
+  /** Shared POST gate for launch routes. Returns the parsed JSON body ({} when none is wanted) or null after answering. */
+  async function launchBody(req, res, { json = true } = {}) {
+    if (!launch) { req.resume(); fail(res, 403, 'launching is disabled (NFW_UI_LAUNCH=0)'); return null; }
+    if (!sameOrigin(req)) { req.resume(); fail(res, 403, 'cross-origin request refused'); return null; }
+    if (json && !String(req.headers['content-type'] ?? '').toLowerCase().startsWith('application/json')) { req.resume(); fail(res, 415, 'expected application/json'); return null; }
+    let size = 0;
+    const chunks = [];
+    for await (const chunk of req) {
+      size += chunk.length;
+      if (size > LAUNCH_BODY_MAX) { req.resume(); fail(res, 413, 'request body too large', { Connection: 'close' }); return null; }
+      chunks.push(chunk);
+    }
+    if (!json) return {};
+    let body;
+    try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { fail(res, 400, 'invalid JSON'); return null; }
+    if (body === null || typeof body !== 'object' || Array.isArray(body)) { fail(res, 400, 'expected a JSON object'); return null; }
+    return body;
+  }
+
+  const validText = (value) => typeof value === 'string' && value.trim() !== '' && value.length <= TEXT_MAX && !value.includes('\0');
+
+  /** Start a job from a validated POST; 409 when another job is active. */
+  function startJob(res, body, spendMessage, validate, start) {
+    if (body.confirmSpend !== true) return fail(res, 400, spendMessage);
+    const problem = validate(body);
+    if (problem) return fail(res, 400, problem);
+    try {
+      const job = start(body);
+      send(res, 202, job.kind === 'approve' ? { jobId: job.jobId, sessionId: job.sessionId } : { jobId: job.jobId });
+    } catch (error) {
+      if (error?.code === 'BUSY') return fail(res, 409, 'another job is running');
+      throw error;
+    }
+  }
+
+  async function launchRoute(req, res, parts) {
+    const [, area, a, b] = parts;
+    const body = await launchBody(req, res, { json: b !== 'cancel' });
+    if (body === null) return;
+    if (area === 'jobs') {
+      const cancelled = jobs.cancel(a);
+      if (!cancelled) fail(res, 404, 'not found'); else send(res, 200, cancelled);
+    } else if (parts.length === 2) {
+      startJob(res, body, SPEND_ANALYSIS,
+        (input) => (!validRepoUrl(input.repoUrl) ? `repoUrl must be a public https://github.com/<owner>/<repo> URL (optionally @ref) or ${LOCAL_DEMO_REPO}`
+          : !validText(input.prompt) ? `prompt must be 1-${TEXT_MAX} characters` : null),
+        (input) => jobs.startAnalyze({ repoUrl: input.repoUrl, prompt: input.prompt }));
+    } else if (b === 'answer') {
+      startJob(res, body, SPEND_ANALYSIS,
+        (input) => (!PROPOSAL_ID.test(a) ? 'invalid proposal id' : !validText(input.answer) ? `answer must be 1-${TEXT_MAX} characters` : null),
+        (input) => jobs.startAnswer({ proposalId: a, answer: input.answer }));
+    } else {
+      startJob(res, body, SPEND_RUN, () => (!PROPOSAL_ID.test(a) ? 'invalid proposal id' : null), () => jobs.startApprove({ proposalId: a }));
+    }
+  }
+
+  async function chat(req, res, found) {
+    if (!sameOrigin(req)) return fail(res, 403, 'cross-origin request refused');
     if (!String(req.headers['content-type'] ?? '').toLowerCase().startsWith('application/json')) return fail(res, 415, 'expected application/json');
     let size = 0;
     const chunks = [];
@@ -284,9 +366,19 @@ export function createApi({ repoRoot, runsRoot, python = defaultPython(repoRoot)
         if (!found) fail(res, 404, 'not found'); else await chat(req, res, found);
         return true;
       }
+      const isLaunch = (area === 'analyses' && parts.length === 2)
+        || (area === 'analyses' && parts.length === 4 && ['answer', 'approve'].includes(b))
+        || (area === 'jobs' && parts.length === 4 && b === 'cancel');
+      if (method === 'POST' && isLaunch) { await launchRoute(req, res, parts); return true; }
+      if (isLaunch) { req.resume(); fail(res, 405, 'method not allowed', { Allow: 'POST' }); return true; }
       if (isChat) { req.resume(); fail(res, 405, 'method not allowed', { Allow: 'POST' }); return true; }
       if (method !== 'GET' && method !== 'HEAD') { req.resume(); fail(res, 405, 'method not allowed', { Allow: 'GET, HEAD' }); return true; }
-      if (area === 'health' && parts.length === 2) send(res, 200, { ok: true, mode: 'replay', runsRoot: runsLabel }, {}, method);
+      if (area === 'health' && parts.length === 2) send(res, 200, { ok: true, mode: launch ? 'replay+launch' : 'replay', launch, runsRoot: runsLabel }, {}, method);
+      else if (area === 'jobs' && parts.length === 2) send(res, 200, { jobs: jobs.list() }, {}, method);
+      else if (area === 'jobs' && parts.length === 3) {
+        const job = JOB_ID.test(a) ? jobs.get(a) : null;
+        if (job) send(res, 200, job, {}, method); else fail(res, 404, 'not found');
+      }
       else if (area === 'runs' && parts.length === 2) await listRuns(res, method);
       else if (area === 'runs' && parts.length === 4 && ['events', 'result', 'presentation'].includes(b)) {
         const found = await resolveRun(a);

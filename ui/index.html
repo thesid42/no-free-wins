@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
-  <meta name="description" content="No Free Wins Sidecar UI. Replays recorded runs from the local bridge, with a scripted demo fallback.">
+  <meta name="description" content="No Free Wins Sidecar UI. Replays recorded runs from the local bridge and, when enabled, launches analyst-driven runs. Scripted demo fallback.">
   <link rel="icon" href="data:,">
   <link rel="stylesheet" href="/src/styles.css">
   <title>No Free Wins · Sidecar preview</title>
@@ -16,9 +16,9 @@
      <div class="chat-column">
       <h1 class="section-label">Conversation</h1><div class="conversation-scroll"><div class="history"><article class="message user"><div class="attachment">↗ parser.py</div><p class="chat-body">Make this parser faster. Keep the output exactly the same.</p></article><article class="message agent"><div class="speaker"><span class="agent-mark">✳</span>No Free Wins</div><p class="chat-body">I’ll try two approaches, check the results, and only keep a speedup we can prove.</p></article></div>
       <div class="chat-extra" role="log" aria-label="Preview conversation" aria-live="polite" aria-relevant="additions"></div></div>
-      <div class="composer-wrap"><div class="suggestions"><button class="cursor-interaction" data-question="Why two workers?">Why two workers?</button><button class="cursor-interaction" data-question="What is being checked?">What’s being checked?</button></div><form class="chat-form" novalidate><div class="source-tray" hidden><label>Code link<input aria-label="Code link" aria-describedby="source-note source-error" type="url" maxlength="2048" placeholder="https://github.com/your-team/repo/blob/main/parser.py"></label><p id="source-note" class="source-note" hidden></p><p id="source-error" class="source-error" role="alert" hidden></p></div><textarea aria-label="Chat with the agent" rows="2" maxlength="2000" placeholder="Ask about this run…"></textarea><div class="composer-actions"><button type="button" class="paste-link">↗ Paste a code link</button><button class="send" type="submit" aria-label="Send message">↑</button></div></form><p class="chat-hint">Local scripted replies · Enter to send · Shift+Enter for a new line</p></div>
+      <div class="composer-wrap"><div class="suggestions"><button class="cursor-interaction" data-question="Why two workers?">Why two workers?</button><button class="cursor-interaction" data-question="What is being checked?">What’s being checked?</button></div><form class="chat-form" novalidate><div class="source-tray" hidden><label><span class="source-label">Code link</span><input aria-label="Code link" aria-describedby="source-note source-error" type="url" maxlength="2048" placeholder="https://github.com/your-team/repo/blob/main/parser.py"></label><p id="source-note" class="source-note" hidden></p><p id="source-error" class="source-error" role="alert" hidden></p></div><p class="mode-chip" role="status" hidden></p><textarea aria-label="Chat with the agent" rows="2" maxlength="2000" placeholder="Ask about this run…"></textarea><div class="composer-actions"><button type="button" class="paste-link">↗ Paste a code link</button><button class="send" type="submit" aria-label="Send message">↑</button></div></form><p class="chat-hint">Local scripted replies · Enter to send · Shift+Enter for a new line</p></div>
      </div>
-     <div class="stage-column"><nav class="sequence" aria-label="Run sequence"></nav><p class="preview-status" role="status" aria-live="polite"></p><section class="stage-surface" aria-label="Pipeline preview"></section></div>
+     <div class="stage-column" tabindex="0" role="region" aria-label="Pipeline workspace"><nav class="sequence" aria-label="Run sequence"></nav><p class="preview-status" role="status" aria-live="polite"></p><section class="stage-surface" aria-label="Pipeline preview"></section></div>
     </main>
    </div></div>
 <noscript>This UI preview needs JavaScript.</noscript>

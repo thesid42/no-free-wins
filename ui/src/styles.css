@@ -424,3 +424,44 @@ html,body{margin:0;min-width:320px;background:light-dark(#f7f8fa,#14171e);color-
 #nfw-ui .message.replay-event .chat-body{color:var(--nfw-soft);font-size:12px}
 @media(pointer:coarse){#nfw-ui .nfw-link{min-height:44px}}
 @media(max-width:440px){#nfw-ui .run-list{max-height:none}#nfw-ui .candidate{padding:12px 10px}#nfw-ui .speed-toggle button{padding:5px 7px}}
+
+/* Analyst-driven launch */
+#nfw-ui button:disabled{opacity:.5;cursor:not-allowed}
+#nfw-ui button:disabled:hover{background:none}
+#nfw-ui .nfw-primary:disabled:hover{background:var(--nfw-ink);color:var(--nfw-page)}
+#nfw-ui .nfw-secondary:disabled:hover{background:var(--nfw-paper)}
+#nfw-ui .send:disabled:hover{background:var(--nfw-ink);color:var(--nfw-page)}
+#nfw-ui .message.card,#nfw-ui .message.confirm-card{width:100%;border:1px solid var(--nfw-line);border-radius:12px;background:var(--nfw-paper);padding:14px 16px}
+#nfw-ui .message.confirm-card{border-color:var(--nfw-brand)}
+#nfw-ui .message.card.stale{opacity:.65}
+#nfw-ui .message.card-failed{border-color:var(--nfw-bad)}
+#nfw-ui .message.notice-error .chat-body{color:var(--nfw-bad);font-size:12px}
+#nfw-ui .message.progress .chat-body{color:var(--nfw-soft);font-size:12px}
+#nfw-ui .card-title{font-size:14px;margin:0 0 6px}
+#nfw-ui .card-target{font-size:12px;margin:0 0 8px;overflow-wrap:anywhere;color:var(--nfw-brand)}
+#nfw-ui .mini-heading{font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--nfw-soft);font-weight:500;margin:12px 0 4px}
+#nfw-ui .plain-list{margin:0;padding-left:20px;font-size:13px;line-height:1.6;overflow-wrap:anywhere}
+#nfw-ui .plain-list li+li{margin-top:3px}
+#nfw-ui .card .nfw-muted,#nfw-ui .confirm-card .nfw-muted{margin:8px 0 0;overflow-wrap:anywhere}
+#nfw-ui .card-quote{white-space:pre-wrap}
+#nfw-ui .card-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}
+#nfw-ui .card-actions button{border:1px solid var(--nfw-line)}
+#nfw-ui .card-actions .nfw-primary{border-color:transparent}
+#nfw-ui .card-details{margin-top:12px;padding-top:8px}
+#nfw-ui .card-details .code-preview,#nfw-ui .nfw-sidecar .card-details .code-preview{max-height:240px;overflow:auto;margin-top:8px}
+#nfw-ui .mode-chip{display:inline-block;margin:0 0 8px;font-size:11px;padding:3px 9px;border-radius:20px;background:var(--nfw-lime);color:var(--nfw-on-lime)}
+#nfw-ui .job-status{display:flex;align-items:center;flex-wrap:wrap;gap:10px;font-size:13px;margin:6px 0 10px;border:1px solid var(--nfw-line);background:var(--nfw-paper);border-radius:12px;padding:12px 14px}
+#nfw-ui .job-status .nfw-mono{margin-left:auto;font-size:12px;color:var(--nfw-soft)}
+#nfw-ui .nfw-motion .job-status .flow-dots{animation:nfw-typing .7s ease-in-out 40 alternate}
+@media(max-width:440px){#nfw-ui .message.card,#nfw-ui .message.confirm-card{padding:12px}#nfw-ui .card-actions button{flex:1 1 auto}}
+
+/* Keep the two desktop panes inside the window; each owns its overflow. */
+@media(min-width:741px){
+ #nfw-ui .nfw-sidecar{display:grid;grid-template-rows:auto auto minmax(0,1fr);height:100dvh;min-height:0}
+ #nfw-ui .nfw-sidecar .nfw-layout{width:100%;margin:0;min-height:0;overflow:hidden}
+ #nfw-ui .nfw-sidecar .chat-column{min-height:0;max-height:none;overflow-y:auto;overscroll-behavior:contain}
+ #nfw-ui .nfw-sidecar .chat-column>.section-label,#nfw-ui .composer-wrap{flex-shrink:0}
+ #nfw-ui .conversation-scroll{min-height:0;overscroll-behavior:contain}
+ #nfw-ui .nfw-sidecar .stage-column{min-height:0;overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable;padding-bottom:72px;scroll-padding-block:24px}
+ #nfw-ui .nfw-sidecar .run-list{max-height:none;overflow:visible}
+}

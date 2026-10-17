@@ -1,5 +1,6 @@
-// Serve only this UI directory plus the read-only replay API (ui/bridge). No .env loading, no proxies,
-// no run launching. Binds to 127.0.0.1 only.
+// Serve only this UI directory plus the replay API and the launch routes (ui/bridge). No .env loading
+// here (the Python CLIs read it themselves), no proxies. Launching spawns only fixed `python -m agent_team`
+// argv arrays; NFW_UI_LAUNCH=0 turns it off. Binds to 127.0.0.1 only.
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { dirname, extname, resolve, sep } from 'node:path';
@@ -12,6 +13,7 @@ const publicFiles = new Set([
   '/src/adapter.js',
   '/src/presentation.js',
   '/src/story.js',
+  '/src/launch-scenes.js',
 ]);
 const repoRoot = resolve(root, '..');
 const api = createApi({ repoRoot, runsRoot: resolve(repoRoot, 'artifacts', 'runs') });
@@ -25,7 +27,7 @@ const server = createServer(async (request, response) => {
     response.setHeader('X-Content-Type-Options', 'nosniff');
     response.setHeader('Referrer-Policy', 'no-referrer');
     response.setHeader('Content-Security-Policy', "default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'");
-    if (await api.handle(request, response)) return; // /api/*: GET/HEAD, plus POST for the chat route only
+    if (await api.handle(request, response)) return; // /api/*: GET/HEAD, plus POST for chat and the launch routes only
     if (!['GET', 'HEAD'].includes(request.method)) {
       response.writeHead(405, { Allow: 'GET, HEAD' }).end('Method not allowed');
       return;
@@ -53,5 +55,7 @@ const server = createServer(async (request, response) => {
 
 server.listen(port, '127.0.0.1', () => {
   console.log(`No Free Wins UI preview: http://127.0.0.1:${port}`);
-  console.log('Read-only replay of recorded runs in artifacts/runs. No run launching, no model calls.');
+  console.log(process.env.NFW_UI_LAUNCH === '0'
+    ? 'Read-only replay of recorded runs in artifacts/runs. Launching is disabled (NFW_UI_LAUNCH=0).'
+    : 'Replay of recorded runs plus launching: analyses and approved runs spend Crusoe/Daytona credits. Set NFW_UI_LAUNCH=0 to disable.');
 });

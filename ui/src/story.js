@@ -1,3 +1,4 @@
+import { analystScene, analysisNote, notReached, repoShort } from './launch-scenes.js';
 import { phaseNames, phaseNotes, proof, recordedCode } from './demo-data.js';
 import { questions, snippet, stageCopy, strategyLabel, workerState } from './presentation.js';
 
@@ -11,12 +12,14 @@ const link = (v, id, label, cls = 'nfw-secondary') => `<a class="nfw-link ${cls}
 
 function controls(v) {
   const r = v.run;
+  if (!r && v.analysis) return '<div class="stage-titlebar"><span class="eyebrow">Analyst / '+esc(phaseNames[v.phase])+'</span></div>';
+  if (r?.live) return `<div class="stage-titlebar"><span class="eyebrow">Live run / ${esc(phaseNames[v.phase])}</span><div class="scene-controls">${v.job && ['queued','running'].includes(v.job.status) ? `<button type="button" data-act="cancel-job" ${v.job.cancelling ? 'disabled' : ''}>${v.job.cancelling ? 'Cancelling…' : 'Cancel run'}</button>` : ''}<button type="button" data-replay>${r.status === 'streaming' ? 'Stop following' : 'Replay run'}</button>${!v.follow && r.status === 'streaming' ? '<button type="button" data-follow>Follow run ↗</button>' : ''}</div></div>`;
   return `<div class="stage-titlebar"><span class="eyebrow">${r ? 'Recorded replay' : 'Example preview'} <span class="chapter-number">${String(Math.max(1, v.phase)).padStart(2, '0')} / 06</span></span><div class="scene-controls">${r ? `<div class="speed-toggle" role="group" aria-label="Replay speed">${[['1', '1×'], ['8', '8×'], ['instant', 'Instant']].map(([s, t]) => `<button type="button" data-speed="${s}" aria-pressed="${String(v.speed) === s}">${t}</button>`).join('')}</div><button type="button" data-replay>${r.status === 'streaming' ? 'Pause replay' : 'Replay run'}</button>${!v.follow && r.status === 'streaming' ? '<button type="button" data-follow>Follow replay ↗</button>' : ''}` : `<button type="button" data-play>${v.playing ? 'Pause preview' : 'Play preview'}</button>`}</div></div>`;
 }
 
 function start(v) {
   const items = v.runs.map(r => `<li><button type="button" class="run-item" data-run="${esc(r.runId)}"><span class="run-main"><span class="record-icon">↗</span><strong>${r.kind === 'repo' ? 'Repository optimization' : 'Log parser optimization'}</strong>${chip(r.verified === true ? 'Verified' : /failed|exhausted/.test(r.state) ? 'Stopped' : 'Recorded', r.verified === true ? 'ok' : '')}</span><span class="run-meta"><span>${esc(r.sessionId || r.runId)}</span><span>${new Date(r.startedUtc).toLocaleDateString([], { month: 'short', day: 'numeric' })}</span></span></button></li>`).join('');
-  return `<div class="input-scene"><div class="start-orbit" aria-hidden="true"><span>nfw↗</span><i></i><i></i></div><h2>A fair race.<br>A provable win.</h2><p class="stage-sub">Watch two strategies become one checked result.<br>Your conversation stays open.</p>${v.api === 'up' ? `<div class="run-picker"><div class="picker-label">Your recorded runs <span>${v.runs.length}</span></div>${items ? `<ul class="run-list" aria-label="Recorded runs">${items}</ul>` : '<p class="run-empty">No recordings on this machine yet.</p>'}</div>` : ''}<button type="button" class="nfw-secondary" data-example>Explore the example ↗</button><div class="supported">${v.api === 'up' ? 'Recorded evidence · launching from a link is coming next' : 'Local demonstration · no models or sandboxes running'}</div></div>`;
+  return `<div class="input-scene"><div class="start-orbit" aria-hidden="true"><span>nfw↗</span><i></i><i></i></div><h2>A fair race.<br>A provable win.</h2><p class="stage-sub">${v.launch && v.api === 'up' ? 'Paste a public GitHub repo in the chat and say what should be faster.<br>Review the analyst’s proposal before starting a run.' : 'Watch two strategies become one checked result.<br>Your conversation stays open.'}</p>${v.api === 'up' ? `<div class="run-picker"><div class="picker-label">Your recorded runs <span>${v.runs.length}</span></div>${items ? `<ul class="run-list" aria-label="Recorded runs">${items}</ul>` : '<p class="run-empty">No recordings on this machine yet.</p>'}</div>` : ''}<button type="button" class="nfw-secondary" data-example>Explore the example ↗</button><div class="supported">${v.api === 'up' ? v.launch ? 'Analyze a repo · or explore recorded evidence' : 'Recorded evidence · replay only' : 'Local demonstration · no models or sandboxes running'}</div></div>`;
 }
 
 function analyze(v) {
@@ -79,10 +82,12 @@ function result(v) {
     return heading(6) + `<div class="outcome-empty"><span>${pending ? '◌' : '↻'}</span><h3>${pending ? 'Waiting for the proof.' : 'No accepted result.'}</h3><p>${pending ? 'The run earns a win only after the evidence checks out.' : 'The system stopped without claiming a speedup.'}</p>${!pending ? `<code>${esc(r?.state || run.terminal?.state || run.meta.state)}</code>` : ''}</div><div class="scene-footer">${pending ? 'Audit pending' : 'Recorded outcome · acceptance rules preserved'}</div>`;
   }
   const data = r || { medianSpeedup: proof.median_speedup, confidenceInterval95: proof.confidence_interval_95, hiddenCases: 2000, timingPairs: 30, sandboxDeleted: true, receiptSha256: proof.receipt_sha256, sourceSha256: proof.source_sha256 };
-  return `<div class="success-heading"><span class="success-check">✓</span>${run ? 'Verified result · recorded' : 'Verified example · recorded'}</div><div class="result-hero"><div class="speed">${fx(data.medianSpeedup)}</div><h2>Faster. With the proof.</h2><p class="interval">95% confidence interval <strong>${data.confidenceInterval95.map(fx).join('–')}</strong></p></div><div class="result-metrics"><div><strong>${data.hiddenCases.toLocaleString()}</strong><span>hidden correctness cases</span></div><div><strong>${data.timingPairs}</strong><span>matched timing pairs</span></div><div><strong>✓</strong><span>${data.sandboxDeleted ? 'sandbox deleted' : 'cleanup unconfirmed'}</span></div></div><div class="result-actions">${run ? link(v, data.optimizedArtifactId, '↓ Optimized code', 'nfw-primary') + `<button type="button" class="nfw-secondary" data-changes aria-expanded="${!!run.changes.open}">${run.changes.open ? 'Hide changes' : 'View changes'}</button>` : '<button type="button" class="nfw-primary" data-download="code">↓ Example optimized.py</button>'}<button type="button" class="nfw-secondary" data-proof aria-expanded="${!!(run || v).proofOpen}">View proof</button></div>${run ? changes(run) : `<details><summary>See example source</summary><pre class="code-preview">${esc(recordedCode)}</pre></details>`}${proofPanel(v, data)}<div class="result-foot">${run ? link(v, data.originalArtifactId, '↓ Original code') : 'Original preserved'}<span>${run ? 'Audited recording · no new benchmark' : 'Development example · no new benchmark'}</span></div>`;
+  return `<div class="success-heading"><span class="success-check">✓</span>${run ? run.live ? 'Verified result · live run' : 'Verified result · recorded' : 'Verified example · recorded'}</div><div class="result-hero"><div class="speed">${fx(data.medianSpeedup)}</div><h2>Faster. With the proof.</h2><p class="interval">95% confidence interval <strong>${data.confidenceInterval95.map(fx).join('–')}</strong></p></div><div class="result-metrics"><div><strong>${data.hiddenCases.toLocaleString()}</strong><span>hidden correctness cases</span></div><div><strong>${data.timingPairs}</strong><span>matched timing pairs</span></div><div><strong>✓</strong><span>${data.sandboxDeleted ? 'sandbox deleted' : 'cleanup unconfirmed'}</span></div></div><div class="result-actions">${run ? link(v, data.optimizedArtifactId, '↓ Optimized code', 'nfw-primary') + `<button type="button" class="nfw-secondary" data-changes aria-expanded="${!!run.changes.open}">${run.changes.open ? 'Hide changes' : 'View changes'}</button>` : '<button type="button" class="nfw-primary" data-download="code">↓ Example optimized.py</button>'}<button type="button" class="nfw-secondary" data-proof aria-expanded="${!!(run || v).proofOpen}">View proof</button></div>${run ? changes(run) : `<details><summary>See example source</summary><pre class="code-preview">${esc(recordedCode)}</pre></details>`}${proofPanel(v, data)}<div class="result-foot">${run ? link(v, data.originalArtifactId, '↓ Original code') : 'Original preserved'}<span>${run ? run.live ? 'Audited result · launched from this page' : 'Audited recording · no new benchmark' : 'Development example · no new benchmark'}</span></div>`;
 }
 
 export function statusText(v) {
+  if (!v.run && v.analysis) return `Analyst · ${repoShort(v.analysis.repoUrl)} · ${analysisNote(v)}`;
+  if (v.run?.live) return v.run.status === 'streaming' ? 'Live run · following the ledger · chat stays open' : v.run.status === 'stopped' ? 'Stopped following · run may still be working' : v.run.status === 'error' ? 'Live stream interrupted' : 'Run complete · inspect the audited result';
   if (!v.run) return v.playing ? `Example replay · ${phaseNames[v.phase]}` : v.phase ? `Example view · ${phaseNames[v.phase]}` : 'Your workspace';
   return v.run.status === 'streaming' ? 'Playing saved evidence · chat stays open' : v.run.status === 'stopped' ? 'Replay paused · choose a stage or replay again' : v.run.status === 'error' ? 'Replay interrupted · your recording is unchanged' : 'Recording complete · inspect any stage';
 }
@@ -95,13 +100,14 @@ function nav(v, i, label) {
 
 export function render(v, animate = false) {
   const app = v.element, phase = v.phase, active = document.activeElement;
-  const focusKey = active && app.contains(active) ? ['data-phase', 'data-speed', 'data-replay', 'data-play', 'data-run', 'data-proof', 'data-changes', 'data-pairs', 'data-follow'].map(a => active.hasAttribute(a) ? `[${a}="${CSS.escape(active.getAttribute(a))}"]` : '').find(Boolean) : '';
+  const focusKey = active && app.contains(active) ? ['data-phase', 'data-speed', 'data-replay', 'data-play', 'data-run', 'data-proof', 'data-changes', 'data-pairs', 'data-follow', 'data-act'].map(a => active.hasAttribute(a) ? `[${a}="${CSS.escape(active.getAttribute(a))}"]` : '').find(Boolean) : '';
   app.dataset.phase = String(phase);
   app.querySelector('.sequence').innerHTML = phaseNames.map((label, i) => nav(v, i, label)).join('');
   const surface = app.querySelector('.stage-surface');
   const changed = surface.dataset.scene !== String(phase);
   surface.dataset.scene = String(phase);
-  surface.innerHTML = controls(v) + [start, analyze, workers, verify, race, zoo, result][phase](v);
+  surface.innerHTML = controls(v) + (!v.run && v.analysis && phase > 0 ? phase === 1 ? analystScene(v) : notReached(v) : [start, analyze, workers, verify, race, zoo, result][phase](v));
+  if (changed) app.querySelector('.stage-column').scrollTop = 0;
   surface.classList.toggle('nfw-motion', animate && !matchMedia('(prefers-reduced-motion: reduce)').matches);
   surface.classList.toggle('scene-enter', changed && animate && !matchMedia('(prefers-reduced-motion: reduce)').matches);
   if (phase === 4 && v.run && !v.run.race.playing) {
@@ -119,11 +125,11 @@ export function render(v, animate = false) {
   surface.querySelectorAll('[data-animal]').forEach((animal, i) => animal.style.setProperty('--entry-delay', `${i * 180}ms`));
   if (focusKey) app.querySelector(focusKey)?.focus({ preventScroll: true });
   app.querySelector('.preview-status').textContent = statusText(v);
-  app.querySelector('.history .agent .chat-body').textContent = v.run ? stageCopy[phase][1] : phaseNotes[phase];
+  app.querySelector('.history .agent .chat-body').textContent = v.run ? stageCopy[phase][1] : v.analysis ? analysisNote(v) : phaseNotes[phase];
   app.querySelector('.history').hidden = phase === 0;
-  app.querySelector('.suggestions').hidden = phase === 0;
+  app.querySelector('.suggestions').hidden = phase === 0 || (!v.run && !!v.analysis);
   app.querySelector('.suggestions').innerHTML = questions[phase].map(q => `<button type="button" data-question="${esc(q)}">${q}</button>`).join('');
-  app.querySelector('.source-tray').hidden = !(v.sourceOpen || phase === 0);
+  app.querySelector('.source-tray').hidden = !(v.sourceOpen || phase === 0) || (!v.run && !!v.analysis);
   app.querySelector('textarea').placeholder = phase === 0 ? v.api === 'up' ? 'Ask about a recording once you choose one…' : 'Tell me what you want changed…' : 'Ask about the work, the code, or the proof…';
   const send = app.querySelector('.send');
   send.textContent = phase === 0 ? v.api === 'up' ? 'Use link ↗' : 'Preview flow ↗' : '↑';
