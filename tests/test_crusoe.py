@@ -477,3 +477,28 @@ class ModelsCliTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ModelParamsTests(unittest.TestCase):
+    def test_model_params_are_merged_into_the_request_for_that_model_only(self):
+        seen = []
+
+        def opener(method, url, headers, body, timeout):
+            seen.append(json.loads(body))
+            return 200, json.dumps({"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+                                    "usage": {"total_tokens": 5}}).encode()
+
+        client = CrusoeClient(api_key="k", opener=opener,
+                              model_params={"Vendor/Fast": {"chat_template_kwargs": {"thinking": False}}})
+        client.complete("vendor/fast", "analyst", [{"role": "user", "content": "x"}], 64)
+        client.complete("other/model", "analyst", [{"role": "user", "content": "x"}], 64)
+        self.assertEqual(seen[0]["chat_template_kwargs"], {"thinking": False})
+        self.assertEqual(seen[0]["model"], "vendor/fast")
+        self.assertNotIn("chat_template_kwargs", seen[1])
+
+    def test_config_rejects_unsupported_model_params(self):
+        from agent_team import config as nfw_config
+        cfg = json.loads(Path(nfw_config.DEFAULT_CONFIG_PATH).read_text())
+        cfg["model_params"] = {"a/b": {"stream": True}}
+        with self.assertRaises(nfw_config.ConfigError):
+            nfw_config.validate_config(cfg)

@@ -478,7 +478,7 @@ class ThreadSafetyTests(unittest.TestCase):
         self.hammer(work)
         self.assertEqual(len(replies), 8)
         self.assertEqual({r.text for r in replies}, {"ok"})
-        self.assertEqual(vars(client).keys(), {"_api_key", "base_url", "timeout", "_opener"})
+        self.assertEqual(vars(client).keys(), {"_api_key", "base_url", "timeout", "_opener", "_model_params"})
 
 
 class HarnessSlotTests(unittest.TestCase):

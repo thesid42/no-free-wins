@@ -1,6 +1,6 @@
 {
   "models": {
-    "analyst": ["deepseek-ai/DeepSeek-V4.1-Flash", "glm-5.3-flash"],
+    "analyst": ["deepseek-ai/DeepSeek-V4.1-Flash", "openai/gpt-oss-120b"],
     "planner": ["nemotron-3-super", "nemotron-3-nano-30b"],
     "worker_a": ["nemotron-3-super", "nemotron-3-nano-30b"],
     "worker_b": ["nemotron-3-super", "nemotron-3-nano-30b"],
@@ -8,9 +8,13 @@
   },
   "run": {"deadline_seconds": 1800, "max_rounds": 2, "max_cost_usd": 5, "max_tokens_per_call": 8192,
           "parallel": true},
-  "analysis": {"max_cost_usd": 1, "max_question_rounds": 5, "max_tokens_per_call": 32768},
+  "analysis": {"max_cost_usd": 1, "max_question_rounds": 5, "max_tokens_per_call": 8192},
   "repo": {"include": "full", "timing_size": 40000,
            "correctness_sizes": [0, 1, 2, 3, 5, 8, 13, 50, 200, 1000]},
   "auto": {"max_prepare_attempts": 3, "max_runs": 2, "max_total_cost_usd": 10,
-           "max_analyst_retries": 2}
+           "max_analyst_retries": 2},
+  "model_params": {
+    "deepseek-ai/DeepSeek-V4.1-Flash": {"chat_template_kwargs": {"thinking": false}},
+    "openai/gpt-oss-120b": {"reasoning_effort": "low"}
+  }
 }

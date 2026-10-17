@@ -81,7 +81,7 @@ def validate_config(config):
     """Return a normalized deep copy of a config dict, or raise ConfigError."""
     if type(config) is not dict:
         raise ConfigError("config must be a JSON object")
-    extra = set(config) - {"models", "run", "analysis", "repo", "auto"}
+    extra = set(config) - {"models", "run", "analysis", "repo", "auto", "model_params"}
     if extra:
         raise ConfigError(f"unknown top-level keys: {', '.join(sorted(extra))}")
     models = _section(config, "models", ROLES)
@@ -129,7 +129,35 @@ def validate_config(config):
             "max_total_cost_usd": _number(auto["max_total_cost_usd"], "auto.max_total_cost_usd",
                                           upper=MAX_OFFICIAL_COST_USD),
             "max_analyst_retries": _integer(auto["max_analyst_retries"], "auto.max_analyst_retries",
-                                            0, MAX_ANALYST_RETRIES)}}
+                                            0, MAX_ANALYST_RETRIES)},
+        "model_params": _model_params(config.get("model_params", {}))}
+
+
+# Extra request fields a model may receive (e.g. turning reasoning off); keyed by exact model id.
+MODEL_PARAM_KEYS = {"chat_template_kwargs", "reasoning_effort", "temperature", "top_p"}
+
+
+def _model_params(value):
+    if type(value) is not dict:
+        raise ConfigError("model_params must map model ids to objects")
+    out = {}
+    for model_id, params in value.items():
+        if type(model_id) is not str or not 1 <= len(model_id) <= 200 or type(params) is not dict:
+            raise ConfigError("model_params must map model ids to objects")
+        unknown = set(params) - MODEL_PARAM_KEYS
+        if unknown:
+            raise ConfigError(f"model_params.{model_id}: unsupported keys {', '.join(sorted(unknown))}")
+        kwargs = params.get("chat_template_kwargs", {})
+        if type(kwargs) is not dict or not all(type(k) is str and type(v) in (bool, int, str)
+                                               for k, v in kwargs.items()):
+            raise ConfigError(f"model_params.{model_id}.chat_template_kwargs must be flat scalars")
+        if "reasoning_effort" in params and params["reasoning_effort"] not in ("low", "medium", "high"):
+            raise ConfigError(f"model_params.{model_id}.reasoning_effort must be low, medium or high")
+        for key in ("temperature", "top_p"):
+            if key in params:
+                _number(params[key], f"model_params.{model_id}.{key}", upper=2)
+        out[model_id.lower()] = dict(params)
+    return out
 
 
 def config_path(path=None):

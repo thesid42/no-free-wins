@@ -139,7 +139,8 @@ def _urllib_opener(method, url, headers, body, timeout):
 
 
 class CrusoeClient:
-    def __init__(self, *, api_key, base_url=DEFAULT_BASE_URL, timeout=120.0, opener=None):
+    def __init__(self, *, api_key, base_url=DEFAULT_BASE_URL, timeout=120.0, opener=None,
+                 model_params=None):
         try:
             url = urlparse(base_url)
             url.port
@@ -155,6 +156,7 @@ class CrusoeClient:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self._opener = opener or _urllib_opener
+        self._model_params = {str(k).lower(): dict(v) for k, v in (model_params or {}).items()}
 
     def __repr__(self):
         return f"CrusoeClient(base_url={self.base_url!r})"
@@ -165,6 +167,9 @@ class CrusoeClient:
         key = env.get("CRUSOE_API_KEY", "")
         if not key:
             raise ValueError("Add CRUSOE_API_KEY to the local .env file first")
+        if "model_params" not in kw:
+            from .config import load_config  # per-model request options, e.g. reasoning off
+            kw["model_params"] = load_config().get("model_params", {})
         return cls(api_key=key, base_url=env.get("CRUSOE_API_URL") or DEFAULT_BASE_URL, **kw)
 
     def _clean(self, text):
@@ -200,9 +205,9 @@ class CrusoeClient:
         return self.complete(model_id, role, messages, max_tokens, timeout_seconds=timeout_seconds)
 
     def complete(self, model_id, role, messages, max_tokens, *, timeout_seconds=None):
-        data = self._request("POST", "/chat/completions",
-                             {"model": model_id, "messages": messages, "max_tokens": max_tokens},
-                             timeout_seconds=timeout_seconds)
+        payload = {**self._model_params.get(model_id.lower(), {}),
+                   "model": model_id, "messages": messages, "max_tokens": max_tokens}
+        data = self._request("POST", "/chat/completions", payload, timeout_seconds=timeout_seconds)
         usage = self._reported_tokens(data)
         try:
             choice = data["choices"][0]
