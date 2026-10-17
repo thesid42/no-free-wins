@@ -11,6 +11,9 @@ const root = dirname(fileURLToPath(import.meta.url));
 const publicFiles = new Set([
   '/index.html', '/src/main.js', '/src/scenes.js', '/src/demo-data.js', '/src/styles.css',
   '/src/adapter.js',
+  '/src/presentation.js',
+  '/src/story.js',
+  '/src/launch-scenes.js',
 ]);
 const repoRoot = resolve(root, '..');
 const api = createApi({ repoRoot, runsRoot: resolve(repoRoot, 'artifacts', 'runs') });

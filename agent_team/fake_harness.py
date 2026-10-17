@@ -7,6 +7,7 @@ Exception instance at either level is raised to simulate infrastructure failure.
 
 import copy
 import math
+import threading
 
 from optimizer_core.canonical import canonical_json, digest
 
@@ -25,6 +26,7 @@ class FakeHarness:
             raise ValueError("task_id must be a 1-128 character string")
         self.script, self.calls, self._n = dict(script or {}), [], 0
         self.task_id = task_id
+        self._lock = threading.Lock()  # screens may run concurrently
 
     def _validate(self, request):
         if (type(request) is not dict or set(request) != REQUEST_KEYS or
@@ -51,10 +53,12 @@ class FakeHarness:
 
     def evaluate_candidate(self, request):
         self._validate(request)
-        self.calls.append(copy.deepcopy(request))
         mode, candidate_id = request["mode"], request["candidate"]["candidate_id"]
-        self._n += 1
-        evidence = [f"fixture-{mode}-{self._n:03d}"]
+        with self._lock:
+            self.calls.append(copy.deepcopy(request))
+            self._n += 1
+            number = self._n
+        evidence = [f"fixture-{mode}-{number:03d}"]
         spec = self.script.get(candidate_id, {})
         if isinstance(spec, Exception):
             raise spec
@@ -100,6 +104,6 @@ class FakeHarness:
             resp["acceptance"].update(accepted=False, origin="synthetic")
         if (resp["status"] == "simulated_acceptance" and type(resp["acceptance"]) is dict
                 and "receipt_id" not in overrides and "receipt_sha256" not in overrides):
-            resp["receipt_id"] = f"fixture-receipt-{self._n:03d}"
+            resp["receipt_id"] = f"fixture-receipt-{number:03d}"
             resp["receipt_sha256"] = digest(canonical_json(resp["acceptance"]))
         return validate_response(resp, request)

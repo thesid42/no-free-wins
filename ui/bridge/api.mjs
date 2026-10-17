@@ -1,13 +1,13 @@
 // Read-only replay API over artifacts/runs/<runId>/ ledgers and audited receipts.
 // Hash chains, canonical JSON and receipt audits stay in Python (inspect_run.py).
 import { execFile } from 'node:child_process';
-import { open, readdir, realpath, stat } from 'node:fs/promises';
+import { open, readFile, readdir, realpath, stat } from 'node:fs/promises';
 import { dirname, join, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
-import { buildProof, buildResult, chatFacts, summarize, verificationOf } from './facts.mjs';
+import { buildPresentation, buildProof, buildResult, chatFacts, summarize, verificationOf } from './facts.mjs';
 import { chatReply } from './chat.mjs';
-import { mapEvent } from './mapping.mjs';
+import { clean, mapEvent } from './mapping.mjs';
 import { createJobs } from './jobs.mjs';
 
 const run = promisify(execFile);
@@ -31,6 +31,9 @@ const VERIFIED_TTL_MS = 60_000;
 const GAP_CAP_MS = 2500;
 const SSE_IDLE_MS = 30 * 60 * 1000; // close a tailing stream after this long with no new ledger lines
 const POLL_MS = 1000;
+const ZOO_LABELS = new Set(['attack', 'honest']);
+const ZOO_ROWS_MAX = 32;
+const ZOO_REPORT_MAX = 256 * 1024;
 const ARTIFACT_KINDS = new Set(['optimized', 'original', 'proof']);
 
 export function defaultPython(repoRoot) {
@@ -109,6 +112,42 @@ export function createApi({
   async function root() {
     realRoot ??= await realpath(runsRoot);
     return realRoot;
+  }
+
+  /** Newest valid artifacts/zoo/<id>/report.json (a sibling of the runs root), allowlisted; never raises. */
+  async function zooReport() {
+    const none = { available: false };
+    try {
+      const zooRoot = join(dirname(await root()), 'zoo');
+      const dirs = [];
+      for (const entry of await readdir(zooRoot, { withFileTypes: true })) {
+        if (!entry.isDirectory() || !RUN_ID.test(entry.name)) continue;
+        try {
+          const info = await stat(join(zooRoot, entry.name, 'report.json'));
+          if (info.isFile() && info.size <= ZOO_REPORT_MAX) dirs.push({ id: entry.name, mtimeMs: info.mtimeMs });
+        } catch { /* still running: no report yet */ }
+      }
+      dirs.sort((x, y) => y.mtimeMs - x.mtimeMs || y.id.localeCompare(x.id));
+      for (const { id, mtimeMs } of dirs) {
+        let report;
+        try { report = JSON.parse(await readFile(join(zooRoot, id, 'report.json'), 'utf8')); } catch { continue; }
+        if (!report || typeof report !== 'object' || !Array.isArray(report.rows) || report.rows.length === 0 || report.rows.length > ZOO_ROWS_MAX) continue;
+        const sha = (v) => (typeof v === 'string' && /^[0-9a-f]{64}$/.test(v) ? v : null);
+        const rows = report.rows.filter((r) => r && ZOO_LABELS.has(r.label) && typeof r.gate_rejected === 'boolean').map((r) => ({
+          fixture: clean(r.fixture, 48) ?? 'fixture', label: r.label, category: clean(r.category, 40) ?? 'unknown',
+          rejected: r.gate_rejected, sourceSha256: sha(r.source_sha256), proofSha256: sha(r.proof_sha256),
+        }));
+        if (!rows.length) continue;
+        const of = (label) => rows.filter((r) => r.label === label);
+        return {
+          available: true, id, measuredUtc: new Date(mtimeMs).toISOString(), surface: clean(report.surface, 120),
+          sandboxDeleted: report.sandbox_deleted === true,
+          attackCount: of('attack').length, attacksCaught: of('attack').filter((r) => r.rejected).length,
+          honestCount: of('honest').length, honestPassed: of('honest').filter((r) => !r.rejected).length, rows,
+        };
+      }
+    } catch { /* no zoo directory */ }
+    return none;
   }
 
   /** Resolve a run id to its ledger path, or null for anything that is not a plain run directory. */
@@ -386,11 +425,13 @@ export function createApi({
         const job = JOB_ID.test(a) ? jobs.get(a) : null;
         if (job) send(res, 200, job, {}, method); else fail(res, 404, 'not found');
       }
+      else if (area === 'zoo' && parts.length === 2) send(res, 200, await zooReport(), {}, method);
       else if (area === 'runs' && parts.length === 2) await listRuns(res, method);
-      else if (area === 'runs' && parts.length === 4 && ['events', 'result'].includes(b)) {
+      else if (area === 'runs' && parts.length === 4 && ['events', 'result', 'presentation'].includes(b)) {
         const found = await resolveRun(a);
         if (!found) fail(res, 404, 'not found');
         else if (b === 'events') await streamEvents(req, res, found, url);
+        else if (b === 'presentation') send(res, 200, buildPresentation(a, await inspectRun(found)), {}, method);
         else send(res, 200, buildResult(a, await inspectRun(found)), {}, method);
       } else if (area === 'artifacts' && parts.length === 3) {
         const colon = a.lastIndexOf(':');

@@ -13,9 +13,27 @@ test('every mapped event has the PipelineEvent shape', () => {
   assert.equal(m.kind, 'preflight');
 });
 
-test('heartbeat and unknown types are skipped', () => {
-  assert.equal(map({ type: 'heartbeat', phase: 'plan' }), null);
+test('only screen and acceptance heartbeats are shown; other heartbeats and unknown types are skipped', () => {
+  for (const phase of ['plan', 'work', 'verify', undefined, 'unknown']) assert.equal(map({ type: 'heartbeat', phase }), null, String(phase));
   assert.equal(map({ type: 'something_new' }), null);
+});
+
+test('acceptance heartbeat is a running race stage event with no numbers from the ledger', () => {
+  const m = map({ type: 'heartbeat', phase: 'acceptance', elapsed_seconds: 123.4, budget: { cost_usd: 0.9 }, median_speedup: 9.99, accepted: true }, 9);
+  assert.equal(m.stage, 'race');
+  assert.equal(m.status, 'running');
+  assert.equal(m.kind, 'heartbeat');
+  assert.equal(m.message, 'Full acceptance running: 2,000 hidden cases and 30 timed pairs in the sandbox…');
+  assert.deepEqual(m.detail, { phase: 'acceptance' });
+  assert.ok(!/9\.99|123|0\.9/.test(JSON.stringify(m)));
+});
+
+test('screen heartbeat is a running verify stage event', () => {
+  const m = map({ type: 'heartbeat', phase: 'screen', elapsed_seconds: 5 });
+  assert.equal(m.stage, 'verify');
+  assert.equal(m.status, 'running');
+  assert.equal(m.message, 'Screening candidates in the sandbox…');
+  assert.deepEqual(m.detail, { phase: 'screen' });
 });
 
 test('analyze-stage events', () => {

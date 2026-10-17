@@ -46,11 +46,17 @@ def _integer(value, where, low, high):
     return value
 
 
-def _section(config, name, required):
+def _boolean(value, where):
+    if type(value) is not bool:
+        raise ConfigError(f"{where} must be true or false")
+    return value
+
+
+def _section(config, name, required, optional=()):
     section = config.get(name)
     if type(section) is not dict:
         raise ConfigError(f"{name} must be an object")
-    missing, extra = set(required) - set(section), set(section) - set(required)
+    missing, extra = set(required) - set(section), set(section) - set(required) - set(optional)
     if missing:
         raise ConfigError(f"{name} is missing: {', '.join(sorted(missing))}")
     if extra:
@@ -80,7 +86,7 @@ def validate_config(config):
         raise ConfigError(f"unknown top-level keys: {', '.join(sorted(extra))}")
     models = _section(config, "models", ROLES)
     run = _section(config, "run", ("deadline_seconds", "max_rounds", "max_cost_usd",
-                                   "max_tokens_per_call"))
+                                   "max_tokens_per_call"), optional=("parallel",))
     analysis = _section(config, "analysis", ("max_cost_usd", "max_question_rounds",
                                              "max_tokens_per_call"))
     repo = _section(config, "repo", ("include", "timing_size", "correctness_sizes"))
@@ -100,7 +106,9 @@ def validate_config(config):
             "max_cost_usd": _number(run["max_cost_usd"], "run.max_cost_usd",
                                     upper=MAX_OFFICIAL_COST_USD),
             "max_tokens_per_call": _integer(run["max_tokens_per_call"], "run.max_tokens_per_call",
-                                            MIN_CALL_TOKENS, MAX_CALL_TOKENS)},
+                                            MIN_CALL_TOKENS, MAX_CALL_TOKENS),
+            # Optional so older config files keep working; absent means the sequential path.
+            "parallel": _boolean(run.get("parallel", False), "run.parallel")},
         "analysis": {
             "max_cost_usd": _number(analysis["max_cost_usd"], "analysis.max_cost_usd",
                                     upper=MAX_OFFICIAL_COST_USD),

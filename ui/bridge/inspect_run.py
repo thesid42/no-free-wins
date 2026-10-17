@@ -150,8 +150,18 @@ def _audit(events, receipts_root):
     if not isinstance(receipt_id, str) or not RUN_ID.match(receipt_id) or ".." in receipt_id:
         return {"valid": False, "error": "invalid receipt id"}, None
     try:
-        decision = audit_receipt(receipts_root / receipt_id / "receipt.json", expected_sha256=sha)
-        return {"valid": True, "decision": decision}, receipt_id
+        path = receipts_root / receipt_id / "receipt.json"
+        decision = audit_receipt(path, expected_sha256=sha)
+        # Only timing scalars leave the inspector, never hidden inputs or their hashes.
+        raw = path.read_bytes()
+        if digest(raw) != sha:
+            raise ValueError("receipt changed during inspection")
+        pairs = strict_json(raw).get("pairs", [])
+        timing = [{"baselineSeconds": p["baseline_seconds"],
+                   "candidateSeconds": p["candidate_seconds"],
+                   "outputsMatch": p["baseline_output_sha256"] == p["candidate_output_sha256"]}
+                  for p in pairs]
+        return {"valid": True, "decision": decision, "pairTimings": timing}, receipt_id
     except (OSError, ValueError, KeyError, TypeError) as exc:
         return {"valid": False, "error": _safe_error(exc)}, receipt_id
 
@@ -200,12 +210,16 @@ def main(argv):
             return {"error": "hash_mismatch", "detail": str(exc)}
         return {"candidateId": cid, "filename": filename, "sha256": sha,
                 "base64": base64.b64encode(data).decode("ascii")}
-    candidates = {}
+    candidates, previews = {}, {}
     for event in events:
         if event.get("type") == "candidate_created":
             target = _safe_child(directory / "candidates", f"{event.get('candidate_id')}.py")
             if target is not None:
-                candidates[event["candidate_id"]] = digest(target.read_bytes())
+                data = target.read_bytes()
+                actual = digest(data)
+                candidates[event["candidate_id"]] = actual
+                if actual == event.get("candidate_sha256") and len(data) <= 262144:
+                    previews[event["candidate_id"]] = data.decode("utf-8", "replace")[:6000]
     original = None
     try:
         kind, filename, data, current = _original(events)
@@ -217,7 +231,7 @@ def main(argv):
     audit, receipt_id = _audit(events, runs_root.parent / "evaluations") if verified else (None, None)
     result = {"ledgerVerified": verified, "ledgerFinalSha256": final, "events": events,
               "receiptAudit": audit, "receiptId": receipt_id,
-              "candidates": candidates, "original": original}
+              "candidates": candidates, "candidatePreviews": previews, "original": original}
     if error:
         result["error"] = error
     return result

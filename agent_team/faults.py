@@ -4,6 +4,8 @@ An injected failure raises ModelError with a visible "injected fault: " prefix a
 without touching the inner client: no network, nothing billed. Logs hold no message content.
 """
 
+import threading
+
 from .models import ModelError
 
 INJECTED_PREFIX = "injected fault: "
@@ -28,6 +30,7 @@ class FaultInjectingClient:
         self._remaining = dict(faults)
         self._calls = {}
         self.log = []
+        self._lock = threading.Lock()  # counters are shared by parallel callers
 
     @property
     def injected_total(self):
@@ -35,11 +38,13 @@ class FaultInjectingClient:
 
     def _inject(self, model_id):
         """Record one call; raise the labeled error while failures remain for this model."""
-        number = self._calls[model_id] = self._calls.get(model_id, 0) + 1
-        injected = self._remaining.get(model_id, 0) > 0
-        self.log.append({"model_id": model_id, "call_index": number, "injected": injected})
+        with self._lock:
+            number = self._calls[model_id] = self._calls.get(model_id, 0) + 1
+            injected = self._remaining.get(model_id, 0) > 0
+            self.log.append({"model_id": model_id, "call_index": number, "injected": injected})
+            if injected:
+                self._remaining[model_id] -= 1
         if injected:
-            self._remaining[model_id] -= 1
             raise ModelError(INJECTED_PREFIX + f"{model_id} call {number} "
                              "(labeled drill, no request sent)", tokens=0)
 

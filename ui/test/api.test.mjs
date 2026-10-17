@@ -138,6 +138,26 @@ describe('path validation', () => {
   }
 });
 
+describe('zoo report', () => {
+  test('{available:false} without a report, newest sanitized report otherwise', async () => {
+    assert.deepEqual((await raw(api.port, '/api/zoo')).json, { available: false });
+    const zoo = join(runsRoot, '..', 'zoo');
+    const row = (label, rejected, extra = {}) => ({ fixture: `${label}-x`, label, category: rejected ? 'incorrect_output' : 'correct', gate_rejected: rejected, source_sha256: 'a'.repeat(64), proof_sha256: null, origin: 'planted', ...extra });
+    const write = (id, report) => { mkdirSync(join(zoo, id), { recursive: true }); writeFileSync(join(zoo, id, 'report.json'), JSON.stringify(report)); };
+    write('old', { rows: [row('attack', false)] });
+    await new Promise((done) => setTimeout(done, 20));
+    write('new', { surface: 'three fixed public cases', sandbox_deleted: true, secret: 'LEAK', rows: [row('attack', true), row('attack', true), row('honest', false), row('honest', true, { fixture: 'bad\nname', source_sha256: 'zz' })] });
+    mkdirSync(join(zoo, 'inprogress'), { recursive: true }); // no report.json yet: ignored
+    const r = (await raw(api.port, '/api/zoo')).json;
+    assert.equal(r.id, 'new');
+    assert.equal(r.available, true);
+    assert.deepEqual([r.attackCount, r.attacksCaught, r.honestCount, r.honestPassed], [2, 2, 2, 1]);
+    assert.equal(r.rows[3].sourceSha256, null);
+    assert.ok(!JSON.stringify(r).includes('LEAK') && !JSON.stringify(r).includes('\n'));
+    assert.match(r.measuredUtc, /^\d{4}-/);
+  });
+});
+
 describe('SSE replay', () => {
   test('ordered events, heartbeat skipped, end event', async () => {
     const r = await raw(api.port, '/api/runs/official-synth-1/events?speed=0');
@@ -155,6 +175,25 @@ describe('SSE replay', () => {
     assert.deepEqual(events.map((e) => e.stage), ['analyze', 'analyze', 'analyze', 'analyze', 'workers', 'workers', 'workers', 'verify', 'verify', 'result']);
     assert.equal(events[7].message, 'Screen worker_a-r1: 3.70× (ranking only), correctness passed');
     assert.equal(events[9].status, 'failed');
+  });
+
+  test('screen and acceptance heartbeats stream as running stage events without ledger numbers', async () => {
+    const u = (n) => `2026-10-17T12:00:${String(n).padStart(2, '0')}.000000Z`;
+    const hb = (phase, n) => ({ type: 'heartbeat', run_id: 'r', utc: u(n), round: 1, phase, elapsed_seconds: 41.5, budget: { cost_usd: 0.4321 } });
+    writeLedger(runsRoot, 'hb-1', [
+      { type: 'run_started', run_id: 'r', utc: u(0), round: 0, session_id: 'dev-hb', max_rounds: 2, screen_bar: 3.0 },
+      hb('plan', 1), hb('work', 2), hb('screen', 3), hb('verify', 4), hb('acceptance', 5),
+      { type: 'terminal', run_id: 'r', utc: u(9), round: 1, state: 'rounds_exhausted', reason: 'none' },
+    ]);
+    const r = await raw(api.port, '/api/runs/hb-1/events?speed=0');
+    const events = parseSse(r.text).slice(0, -1).map((f) => f.data);
+    assert.deepEqual(events.map((e) => [e.kind, e.stage, e.status]), [
+      ['run_started', 'analyze', 'running'], ['heartbeat', 'verify', 'running'], ['heartbeat', 'race', 'running'], ['terminal', 'result', 'failed'],
+    ]);
+    assert.equal(events[1].message, 'Screening candidates in the sandbox…');
+    assert.equal(events[2].message, 'Full acceptance running: 2,000 hidden cases and 30 timed pairs in the sandbox…');
+    assert.deepEqual(events[2].detail, { phase: 'acceptance' });
+    for (const forbidden of ['41.5', '0.4321', 'budget', 'elapsed']) assert.ok(!r.text.includes(forbidden), `leaked ${forbidden}`);
   });
 
   test('allowlist: no prompts, descriptions, attempt detail or extra fields leak', async () => {

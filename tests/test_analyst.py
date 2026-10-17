@@ -27,7 +27,7 @@ GENERATOR = ("import random\n\n\ndef generate_input(seed, size):\n"
              "    rng = random.Random(seed)\n    return [str(rng.randrange(100)) for _ in range(size)]\n")
 TARGET_SOURCE = "def load(rows):\n    return rows\n" + "# pad\n" * 2000
 LIVE_IDS = [
-    "deepseek-ai/Deepseek-V4-Flash", "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B",
+    "deepseek-ai/Deepseek-V4-Flash", "deepseek-ai/DeepSeek-V4.1-Flash", "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B",
     "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B", "zai-org/GLM-5.3-Flash"]
 
 
@@ -182,11 +182,11 @@ class ProposalTests(AnalystCase):
     def test_default_order_and_budget_come_from_config_and_the_listing(self):
         self.use_repo_task()
         client = ListingClient({
-            "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B": [proposal_reply()]})
+            "deepseek-ai/DeepSeek-V4.1-Flash": [proposal_reply()]})
         result = analyst.analyze(repo="r", prompt=PROMPT, client=client, proposals_root=self.proposals,
                                  snapshot_root=self.snapshots, new_id=lambda: "prop1")
         self.assertEqual(result["status"], "proposal")
-        self.assertEqual(client.calls[0][0], "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B")
+        self.assertEqual(client.calls[0][0], "deepseek-ai/DeepSeek-V4.1-Flash")
 
     def test_new_analysis_needs_repo_and_prompt_and_continuation_an_answer(self):
         self.use_repo_task()
@@ -779,12 +779,12 @@ class ConfigTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("NFW_CONFIG", None)
             config = nfw_config.load_config()
-        self.assertEqual(config["models"]["analyst"], ("nemotron-3-super", "glm-5.3-flash"))
+        self.assertEqual(config["models"]["analyst"], ("deepseek-ai/DeepSeek-V4.1-Flash", "glm-5.3-flash"))
         self.assertEqual(config["models"]["verifier"], ("glm-5.3-flash", "deepseek-v4-flash"))
         self.assertEqual(config["run"], {"deadline_seconds": 1800, "max_rounds": 2, "max_cost_usd": 5,
-                                         "max_tokens_per_call": 8192})
+                                         "max_tokens_per_call": 8192, "parallel": True})
         self.assertEqual(config["analysis"], {"max_cost_usd": 1, "max_question_rounds": 5,
-                                              "max_tokens_per_call": 8192})
+                                              "max_tokens_per_call": 32768})
         self.assertEqual(config["repo"], {"include": "full", "timing_size": 40000,
                                           "correctness_sizes": [0, 1, 2, 3, 5, 8, 13, 50, 200, 1000]})
         self.assertEqual(config["auto"], {"max_prepare_attempts": 3, "max_runs": 2,

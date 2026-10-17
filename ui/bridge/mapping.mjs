@@ -146,7 +146,14 @@ export function mapEvent(runId, sequence, event) {
         candidate_id: id(event.candidate_id), mode,
       });
     }
+    case 'heartbeat': {
+      // Only the two long sandbox phases are surfaced, so the stage does not look stuck. Public strings only: no
+      // budget, elapsed time or numbers are copied, and a client must not read results from this event.
+      if (event.phase === 'acceptance') return make('race', 'running', 'Full acceptance running: 2,000 hidden cases and 30 timed pairs in the sandbox…', { phase: 'acceptance' });
+      if (event.phase === 'screen') return make('verify', 'running', 'Screening candidates in the sandbox…', { phase: 'screen' });
+      return null; // other heartbeats are not shown
+    }
     default:
-      return null; // heartbeat and unknown event types are not shown
+      return null; // unknown event types are not shown
   }
 }

@@ -54,6 +54,24 @@ export function artifactIds(runId) {
   return { originalArtifactId: `${runId}:original`, optimizedArtifactId: `${runId}:optimized`, proofArtifactId: `${runId}:proof` };
 }
 
+/** Small, verified source excerpts and measured pairs for the visual replay. No inputs are exposed. */
+export function buildPresentation(runId, inspected) {
+  const result = buildResult(runId, inspected);
+  const candidates = Object.create(null);
+  if (inspected.ledgerVerified === true) {
+    for (const [id, source] of Object.entries(inspected.candidatePreviews ?? {})) {
+      if (/^[A-Za-z0-9._-]{1,64}$/.test(id) && typeof source === 'string') candidates[id] = source.slice(0, 6000);
+    }
+  }
+  const pairTimings = result.accepted && result.receiptAuditValid
+    ? (inspected.receiptAudit?.pairTimings ?? []).filter(p =>
+      Number.isFinite(p.baselineSeconds) && p.baselineSeconds > 0
+      && Number.isFinite(p.candidateSeconds) && p.candidateSeconds > 0
+      && p.outputsMatch === true).slice(0, 30)
+    : [];
+  return { candidates, pairTimings };
+}
+
 /** Accepted only when the verified ledger, the acceptance event and the audited receipt all agree. */
 export function buildResult(runId, inspected) {
   const events = inspected.events;
@@ -143,6 +161,7 @@ export function chatFacts(runId, inspected) {
   const acceptances = events.filter((e) => e.type === 'acceptance_result');
   return {
     result, runId, events, kind: kindOf(events), strategies, orders, candidates, screens, verdicts, acceptances,
+    sourcePreview: inspected.ledgerVerified ? inspected.candidatePreviews?.[result.candidateId] ?? '' : '',
     models: started?.models ?? null,
     minimumSpeedup: minimumSpeedup(inspected, acceptances),
     maxRounds: started?.max_rounds ?? null, budget: budgetSource?.budget ?? null,

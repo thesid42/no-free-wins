@@ -2,6 +2,7 @@
 
 import copy
 from dataclasses import dataclass
+import threading
 from typing import Protocol
 
 
@@ -35,13 +36,16 @@ class FixtureModelClient:
     def __init__(self, script):
         self.script = {model: list(queue) for model, queue in script.items()}
         self.calls = []
+        self._lock = threading.Lock()  # parallel workers/verifiers may call concurrently
 
     def complete(self, model_id, role, messages, max_tokens):
-        self.calls.append((model_id, role, copy.deepcopy(messages)))
-        queue = self.script.get(model_id)
-        if not queue:
-            raise ModelError("fixture exhausted")
-        item = queue.pop(0)
+        recorded = (model_id, role, copy.deepcopy(messages))
+        with self._lock:
+            self.calls.append(recorded)
+            queue = self.script.get(model_id)
+            if not queue:
+                raise ModelError("fixture exhausted")
+            item = queue.pop(0)
         if isinstance(item, Exception):
             raise item
         if type(item) is str:

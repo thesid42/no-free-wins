@@ -7,6 +7,7 @@
 import { codeBytes, proof, phaseNames, phaseNotes } from './demo-data.js';
 import { render, repoShort, timelineModel, stepIcon, autoOutcome } from './scenes.js';
 import { createAdapter, repoUrlProblem, isJobActive, ApiError } from './adapter.js';
+import { lineDiff, milestone } from './presentation.js';
 
 const adapter = createAdapter();
 const STAGE_PHASE = { analyze: 1, workers: 2, verify: 3, race: 4, zoo: 5, result: 6 };
@@ -65,7 +66,6 @@ const view = {
   sourceOpen: true,
   playing: false,
   timer: null,
-  options: { renderer: 'Line graph' },
   mode: 'auto', // start-screen choice: 'auto' (default) or 'manual' (step-by-step)
   api: 'checking',
   launch: false,
@@ -74,6 +74,8 @@ const view = {
   busy: false, // a launch request is in flight
   runs: [],
   runsError: '',
+  zoo: null, // newest real cheating-zoo report from /api/zoo, or null (recorded fallback text)
+  zooLoading: false,
   run: null,
   speed: 8,
   follow: true,
@@ -99,6 +101,10 @@ function go(phase, animate = false) {
   frame = 0;
   render(view, animate);
   syncUi();
+  if (view.phase === 5 && view.api === 'up' && !view.zooLoading) { // pick up a report written since page load
+    view.zooLoading = true;
+    loadZoo().finally(() => { view.zooLoading = false; if (view.phase === 5) refresh(); });
+  }
 }
 
 function redraw() {
@@ -197,6 +203,7 @@ function addMessage(role, text, speakerText = '✳ No Free Wins · demo', extra 
   article.append(body);
   messages.append(article);
   conversation.scrollTop = conversation.scrollHeight;
+  return article;
 }
 
 // ---- recorded-run replay -----------------------------------------------------------------
@@ -211,8 +218,13 @@ function newRun(meta) {
     seen: new Set(),
     failed: new Set(),
     terminal: null,
+    activity: null, // { stage, message } while a long sandbox phase (screen, full acceptance) is running
     result: null,
     resultState: 'idle',
+    milestones: new Set(),
+    race: { current: 0, total: 0, playing: false },
+    changes: { open: false, state: 'idle' },
+    presentation: { candidates: {}, pairTimings: [] },
     error: '',
     data: {
       sessionId: meta.sessionId, models: null, maxRounds: null, deadline: null, label: '', faults: [],
@@ -226,6 +238,7 @@ function applyEvent(run, event) {
   const x = event.detail && typeof event.detail === 'object' ? event.detail : {};
   const text = (v) => (typeof v === 'string' ? v : undefined);
   const worker = (key) => (typeof key === 'string' ? (d.workers[key] ||= { attempts: [] }) : null);
+  if (event.kind !== 'heartbeat') run.activity = null; // any real ledger event ends the "still running" indicator
   const candidate = (id) => (typeof id === 'string' ? (d.candidates[id] ||= {}) : null);
   switch (event.kind) {
     case 'run_started':
@@ -253,9 +266,15 @@ function applyEvent(run, event) {
       const c = candidate(x.candidate_id);
       if (w && c) {
         Object.assign(w, { candidateId: x.candidate_id, sha: text(x.candidate_sha256), attempts: Array.isArray(x.attempts) ? x.attempts : [] });
+        delete w.visualAttempt;
         w.strategyId = text(x.strategy_id) || w.strategyId;
         Object.assign(c, { worker: x.worker, sha: w.sha, strategyId: w.strategyId });
       }
+      break;
+    }
+    case 'worker_failed': {
+      const w = worker(x.worker);
+      if (w) Object.assign(w, { failed: true, attempts: x.attempts || [] });
       break;
     }
     case 'screen_result':
@@ -269,6 +288,9 @@ function applyEvent(run, event) {
       break;
     case 'terminal':
       run.terminal = x;
+      break;
+    case 'heartbeat': // a progress indicator only: the bridge sends no numbers and none are read here
+      if ((event.stage === 'race' || event.stage === 'verify') && typeof event.message === 'string') run.activity = { stage: event.stage, message: event.message.slice(0, 200) };
       break;
     default:
   }
@@ -284,14 +306,18 @@ function clearReplayMessages() {
 
 function onEvent(run, event) {
   const known = Object.hasOwn(STAGE_PHASE, event.stage);
+  run.lastStage = event.stage;
   applyEvent(run, event);
   if (event.kind === 'acceptance_result' && run.resultState === 'idle') fetchResult(run).then(() => { if (view.run === run) refresh(); });
   if (known) {
     run.seen.add(event.stage);
     if (event.status === 'failed') run.failed.add(event.stage);
   }
-  const message = typeof event.message === 'string' ? event.message.slice(0, 400) : '';
-  if (message) addMessage('agent', message, `✳ ${run.live ? 'Live' : 'Replay'} · ${known ? event.stage : 'run'}`, 'replay-event');
+  const message = milestone(event.stage);
+  if (message && !run.milestones.has(event.stage)) {
+    run.milestones.add(event.stage);
+    addMessage('agent', message, `✳ No Free Wins · ${run.live ? 'live' : 'replay'}`, 'replay-event');
+  }
   if (view.follow && known && view.phase !== STAGE_PHASE[event.stage]) go(STAGE_PHASE[event.stage], true);
   else refresh();
 }
@@ -310,6 +336,9 @@ async function loadResult(run) {
   refresh();
   await run.resultPromise?.catch(() => {});
   await fetchResult(run);
+  if (run.live) {
+    try { run.presentation = await adapter.presentation(run.id, run.controller.signal); } catch { /* optional source preview */ }
+  }
   if (view.run !== run) return;
   // Between the runs of an autonomous job the next run replaces this one; the job's end decides what to show.
   const hold = !!run.auto && jobActive();
@@ -323,6 +352,10 @@ async function replay(meta, { live = false, auto = false, instant = false } = {}
   stop();
   chatController?.abort();
   const run = newRun(meta);
+  run.presentationPromise = adapter.presentation(meta.runId, run.controller.signal).then(
+    data => { run.presentation = data; if (view.run === run) refresh(); },
+    () => {},
+  );
   run.live = live;
   run.auto = auto;
   view.run = run;
@@ -339,7 +372,18 @@ async function replay(meta, { live = false, auto = false, instant = false } = {}
     const options = { speed: instant ? 0 : SPEED_PARAM[view.speed], onEnd: (state) => { run.endState = state; } };
     for await (const event of adapter.events(meta.runId, run.controller.signal, options)) {
       if (view.run !== run) return;
+      if (event.kind === 'candidate_created') await showAttempts(run, event);
+      if (run.controller.signal.aborted || view.run !== run) return;
       onEvent(run, event);
+      if (event.kind === 'acceptance_result' && !run.live) {
+        await run.presentationPromise;
+        await run.resultPromise;
+        await replayPairs(run);
+        if (view.follow && view.speed !== 'instant' && !run.controller.signal.aborted) {
+          go(5, true);
+          await delay(1600, run.controller.signal);
+        }
+      }
     }
     if (run.controller.signal.aborted) {
       if (view.run === run) run.status = 'stopped';
@@ -357,6 +401,66 @@ async function replay(meta, { live = false, auto = false, instant = false } = {}
   }
 }
 
+function delay(ms, signal) {
+  return new Promise(resolve => {
+    if (signal.aborted || ms <= 0) return resolve();
+    const finish = () => { clearTimeout(timer); signal.removeEventListener('abort', finish); resolve(); };
+    const timer = setTimeout(finish, ms);
+    signal.addEventListener('abort', finish, { once: true });
+  });
+}
+
+async function showAttempts(run, event) {
+  const attempts = event.detail?.attempts || [];
+  if (run.live || attempts.length < 2 || view.speed === 'instant') return;
+  const key = event.detail.worker;
+  const worker = run.data.workers[key];
+  if (!worker) return;
+  for (const attempt of attempts) {
+    if (run.controller.signal.aborted || view.run !== run) return;
+    worker.visualAttempt = attempt;
+    if (view.follow) go(2, true); else refresh();
+    await delay(view.speed === 1 ? 1000 : 550, run.controller.signal);
+  }
+}
+
+async function replayPairs(run) {
+  const pairs = run.presentation.pairTimings || [];
+  if (!run.result?.accepted || !pairs.length || run.race.playing) return;
+  run.race.total = pairs.length;
+  if (view.speed === 'instant') { run.race.current = pairs.length; refresh(); return; }
+  run.race.playing = true;
+  for (let i = 0; i < pairs.length; i++) {
+    if (run.controller.signal.aborted || view.run !== run) break;
+    run.race.current = i + 1;
+    run.race.pair = pairs[i];
+    run.race.windowMs = view.speed === 1 ? 1000 : 420;
+    if (view.follow) go(4, true); else refresh();
+    await delay(run.race.windowMs + 60, run.controller.signal);
+  }
+  run.race.playing = false;
+  if (view.run === run) refresh();
+}
+
+async function showChanges() {
+  const run = view.run;
+  if (!run?.result?.accepted) return;
+  run.changes.open = !run.changes.open;
+  if (run.changes.state === 'idle') {
+    run.changes.state = 'loading';
+    refresh();
+    try {
+      const [original, optimized] = await Promise.all([
+        adapter.source(run.result.originalArtifactId, run.controller.signal),
+        adapter.source(run.result.optimizedArtifactId, run.controller.signal),
+      ]);
+      run.changes.diff = lineDiff(original, optimized);
+      run.changes.state = 'ready';
+    } catch { run.changes.state = 'error'; }
+  }
+  if (view.run === run) refresh();
+}
+
 async function loadRuns() {
   try {
     view.runs = await adapter.runs(AbortSignal.timeout(5000));
@@ -367,6 +471,10 @@ async function loadRuns() {
   }
 }
 
+async function loadZoo() {
+  try { view.zoo = await adapter.zoo(AbortSignal.timeout(5000)); } catch { view.zoo = null; }
+}
+
 async function connect() {
   try {
     const health = await adapter.health(AbortSignal.timeout(4000));
@@ -374,6 +482,7 @@ async function connect() {
     view.api = 'up';
     view.launch = health.launch === true;
     await loadRuns();
+    await loadZoo();
   } catch {
     view.api = 'down';
     view.launch = false;
@@ -1210,9 +1319,20 @@ app.addEventListener('click', (event) => {
     redraw();
   } else if (button.hasAttribute('data-example')) {
     startExample();
-  } else if (button.hasAttribute('data-renderer')) {
-    view.options.renderer = view.options.renderer === 'ASCII' ? 'Line graph' : 'ASCII';
+  } else if (button.hasAttribute('data-changes')) {
+    showChanges();
+  } else if (button.hasAttribute('data-pairs')) {
+    const run = view.run;
+    if (run) { view.follow = true; run.race.current = 0; replayPairs(run); }
+  } else if (button.hasAttribute('data-proof')) {
+    const owner = view.run || view;
+    owner.proofOpen = !owner.proofOpen;
     redraw();
+  } else if (button.hasAttribute('data-zoo')) {
+    go(5, true);
+  } else if (button.hasAttribute('data-follow')) {
+    view.follow = true;
+    go(STAGE_PHASE[view.run.lastStage] || view.phase, true);
   } else if (button.hasAttribute('data-question')) {
     chat(button.dataset.question);
   } else if (button.hasAttribute('data-download')) {

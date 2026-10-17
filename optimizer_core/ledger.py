@@ -6,10 +6,24 @@ Never grant a candidate write access to this directory.
 
 import os
 from pathlib import Path
+import threading
 
 from .canonical import canonical_json, digest, strict_json
 
 ZERO = "0" * 64
+
+# One lock per resolved ledger path: concurrent appends from threads in this process serialize around
+# read-verify-append, so the hash chain never forks. Cross-process writers still need one controller.
+_path_locks, _path_locks_guard = {}, threading.Lock()
+
+
+def _lock_for(path):
+    key = str(path.resolve())
+    with _path_locks_guard:
+        lock = _path_locks.get(key)
+        if lock is None:
+            lock = _path_locks[key] = threading.Lock()
+        return lock
 
 
 def verify_ledger(path):
@@ -35,11 +49,16 @@ def verify_ledger(path):
 
 
 def append_event(path, event):
-    """Single writer only; the future orchestrator owns serialization."""
+    """One writing process per ledger; threads in it are serialized by a per-path lock."""
     if type(event) is not dict or not event.get("type"):
         raise ValueError("event requires a type")
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    with _lock_for(path):
+        return _append_locked(path, event)
+
+
+def _append_locked(path, event):
     records = verify_ledger(path) if path.exists() else []
     body = {"seq": len(records) + 1,
             "prev_sha256": records[-1]["sha256"] if records else ZERO,

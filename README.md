@@ -24,7 +24,7 @@ Status as of October 17, 2026:
 | Live Crusoe agents and independent model verifier | Validated with real Nemotron workers, GLM verifier, and measured Daytona acceptance |
 | Repo input | Event-built development feature: `repo-dev-1` on `examples/textstats` reached `verified_done` at 8.03× (95% CI 7.76–8.21×, receipt audited); not part of the official result |
 | Shared playbook / regression growth | Placeholder interfaces; learning flow remains pending |
-| Sidecar UI | Standalone local skeleton in `ui/`; scripted chat and pipeline scenes, with backend integration deliberately deferred |
+| Sidecar UI | Local chat and line-graph pipeline in `ui/`; recorded replay, analyst proposals and approved live launches are connected |
 | Official autonomous run and demo | Official session `official-20261017-3`: `verified_done`, median 3.54x, 95% CI 3.49–3.62x, receipt audit and ledger verified (sessions 1–2 failed on Daytona latency; all disclosed in PREP.md). Demo pending |
 
 ### Development evidence
@@ -101,7 +101,7 @@ python -m agent_team run --session-id my-agent-dev --max-cost-usd 1 --max-rounds
 
 ## Sidecar UI preview
 
-The selected interface has chat on the left and a pipeline canvas on the right. The standalone skeleton includes link/instruction input, seven stage views (start, analysis, workers, verification, timing race, cheating zoo, result), replay/pause, an ASCII view, and example code/proof downloads. Chat stays available during replay. Narrow screens stack the pipeline above the conversation; light/dark themes and reduced motion follow system preferences.
+The selected interface has chat on the left and a pipeline canvas on the right. It includes seven stage views (start, analysis, workers, verification, timing race, cheating zoo, result), a line graph with animated handoffs, recorded fallback recovery, candidate source excerpts, replay/pause, and code/proof downloads. ASCII mode has been removed. Chat stays available with one milestone per major stage and contextual questions. On desktop the pipeline scrolls independently inside the window, with padding below its content; the chat composer stays visible and conversation history has its own scroll area. Narrow screens stack the pipeline above the conversation; light/dark themes and reduced motion follow system preferences.
 
 Use Node.js 22 or newer on Windows or macOS. No npm dependencies or API keys are needed:
 
@@ -112,7 +112,9 @@ npm run dev
 
 Open `http://127.0.0.1:5173`. Run `npm run check` for JavaScript syntax checks.
 
-**Replay integration (event-built, development).** When `npm run dev` is started from this repository, `ui/server.mjs` also serves a local-only API (127.0.0.1, same-origin, read-only) over this machine's `artifacts/runs/` ledgers: a recorded-runs list, ledger events streamed into the seven scenes, results taken from audited receipts, downloads of the optimized code, original code and proof, and chat answers templated from the run's real data (no model calls). A replay is a recording, not a new run. Launching is connected too (development): paste a public GitHub repo URL and a prompt; after an in-chat spend confirmation the bridge runs `agent_team analyze`, shows the analyst's proposal, questions or not-feasible answer with suggestions in the chat, sends your replies as answers, and on **Approve & run** runs `approve --run` and live-tails the run into the scenes. One job at a time, fixed argv with no shell, same-origin and Host checks, and cancel sends SIGINT first so the Python side can clean up. Set `NFW_UI_LAUNCH=0` for replay only. Without the API the page falls back to the original scripted demo. `npm test` runs the bridge tests.
+**Replay integration (event-built, development).** When `npm run dev` is started from this repository, `ui/server.mjs` also serves a local-only API (127.0.0.1, same-origin) with read-only replay routes over this machine's `artifacts/runs/` ledgers: a recorded-runs list, ledger events streamed into the seven scenes, results taken from audited receipts, downloads of the optimized code, original code and proof, and chat answers templated from the run's real data (no model calls). A replay is a recording, not a new run. Launching is connected too (development): paste a public GitHub repo URL and a prompt; after an in-chat spend confirmation the bridge runs `agent_team analyze`, shows the analyst's proposal, questions or not-feasible answer with suggestions in the chat, sends your replies as answers, and on **Approve & run** runs `approve --run` and live-tails the run into the scenes. One job at a time, fixed argv with no shell, same-origin and Host checks, and cancel sends SIGINT first so the Python side can clean up. Set `NFW_UI_LAUNCH=0` for replay only. Without the API the page falls back to the original scripted demo. `npm test` runs the bridge tests.
+
+The race can replay the actual 30 measured pairs from an audited accepted receipt, showing the stored durations and matched-output status. It never invents progress when only an aggregate result is available. The zoo is a separate recorded development pilot, not an acceptance stage of the selected run. Results include a bounded source diff and an expandable proof panel. Replaying these scenes starts no model calls or sandbox jobs.
 
 ## Optimize your own repo (development)
 
@@ -180,7 +182,7 @@ The harness task abstraction behind this was added after the freeze. The `logs-p
 - [x] **B + A:** validate live Crusoe generation and independent verification through measured Daytona acceptance. Both successful and unsuccessful development runs are recorded; retry/fallback and failure paths also have offline regression coverage.
 - [x] **Joint:** wire `optimizer_core.harness.evaluate_candidate` through `agent_team/live.py`, with candidate hashes, verifier evidence, receipts, and one official ledger writer.
 - [ ] **B / joint:** implement the shared playbook and validated regression flow; the current classes are placeholders.
-- [ ] **UI / deferred:** connect source ingestion, live chat, pipeline events, actual artifact delivery, and failure/cancellation states when integration is requested. The Sidecar skeleton currently uses local demo state only.
+- [ ] **UI / live validation:** exercise a complete public GitHub launch from the UI. Launch integration, ledger-based chat, pipeline events, artifact delivery and failure/cancellation controls are implemented; browser launch checks use mocked jobs.
 - [ ] **A + joint:** validate the merged path, preserve both preparation baselines, freeze the evaluation configuration, and prepare a fresh official session before agents start.
 - [x] **Joint:** complete a live autonomous development run, audit its actual result, verify the official message ledger, and confirm cleanup.
 - [ ] **Joint:** complete the official session and a labeled live recovery drill after injected failures. The recorded successful development run used primary model calls throughout.

@@ -144,6 +144,19 @@ export function createAdapter() {
     result(runId, signal) {
       return request(`${runPath(runId)}/result`, { signal });
     },
+    /** Newest zoo report (read-only, sanitized by the bridge) or { available: false }. */
+    async zoo(signal) {
+      const body = await request('/api/zoo', { signal });
+      return body && body.available === true && Array.isArray(body.rows) ? body : null;
+    },
+    presentation(runId, signal) {
+      return request(`${runPath(runId)}/presentation`, { signal });
+    },
+    async source(artifactId, signal) {
+      const response = await fetch(this.artifactUrl(artifactId), { cache: 'no-store', signal });
+      if (!response.ok) throw new Error('Source unavailable');
+      return response.text();
+    },
     async chat(runId, message, signal) {
       const body = await request(`${runPath(runId)}/chat`, {
         method: 'POST',

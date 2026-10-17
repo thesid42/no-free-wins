@@ -6,7 +6,8 @@
     "worker_b": ["nemotron-3-super", "nemotron-3-nano-30b"],
     "verifier": ["glm-5.3-flash", "deepseek-v4-flash"]
   },
-  "run": {"deadline_seconds": 1800, "max_rounds": 2, "max_cost_usd": 5, "max_tokens_per_call": 8192},
+  "run": {"deadline_seconds": 1800, "max_rounds": 2, "max_cost_usd": 5, "max_tokens_per_call": 8192,
+          "parallel": true},
   "analysis": {"max_cost_usd": 1, "max_question_rounds": 5, "max_tokens_per_call": 32768},
   "repo": {"include": "full", "timing_size": 40000,
            "correctness_sizes": [0, 1, 2, 3, 5, 8, 13, 50, 200, 1000]},

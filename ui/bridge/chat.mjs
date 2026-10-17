@@ -3,13 +3,16 @@ const fx = (n, d = 3) => `${Number(n).toFixed(d)}×`;
 const list = (items) => items.length ? items.join(', ') : 'none recorded';
 
 const TOPICS = [
+  ['changes', /what.*chang|code.*chang|\bdiff\b/],
+  ['recovery', /fallback|recover|retry|primary unavailable/],
+  ['timing', /timing|benchmark|measur|race|matched pairs/],
   ['why_two', /why\b.*\b(two|2|both|multiple|more than one)\b|\btwo workers?\b|\b2 workers?\b/],
   ['ci', /\bci\b|confidence|interval|bootstrap|uncertain/],
   ['cost', /cost|budget|token|price|spend|\$|dollar|money|expens/],
-  ['speedup', /speed|faster|fast|median|\bx\b|×|times|improv|result/],
+  ['speedup', /speed|faster|fast|median|\bx\b|×|times|improv|result|counts as a win/],
   ['verifier', /verif|approv|review/],
   ['workers', /worker|strateg|plan|agent|candidate|team/],
-  ['zoo', /zoo|cheat|attack|honeytrap|adversar/],
+  ['zoo', /zoo|cheat|attack|adversar|honest controls/],
   ['models', /model|llm|nemotron|glm|deepseek|crusoe|provider/],
   ['checked', /check|correct|hidden|proof|audit|receipt|trust|sandbox|valid|safe|prove|honest/],
 ];
@@ -25,6 +28,23 @@ function acceptance(f) {
 }
 
 const answers = {
+  changes(f) {
+    if (!f.result.accepted) return 'There is no accepted optimization to compare in this run. Candidate generation alone does not establish a win.';
+    if (f.sourcePreview?.includes('Counter') && /\.update\(/.test(f.sourcePreview)) {
+      return 'The selected code counts tokens with Counter.update while reading the lines, then ranks the counts. View changes compares the original target module with the generated solve(data) module; imports and the entry point can differ.';
+    }
+    return `The selected module is ${f.result.candidateId}. View changes shows its actual line diff against the original target module. Matching tested outputs and the audited timing result are checked separately.`;
+  },
+  timing(f) {
+    if (!f.acceptances.length) return 'No full timing test was recorded in this run. A screen only ranks candidates; it cannot establish an accepted speedup.';
+    return `The harness uses ${f.result.timingPairs ?? 'matched'} matched timing pairs on the same machine, executed serially. Each measured output must match. The animated race replays stored receipt measurements; it is not a new benchmark.`;
+  },
+  recovery(f) {
+    const recovered = f.events.filter(e => e.type === 'candidate_created' && e.attempts?.some(a => a.kind === 'fallback' && a.outcome === 'ok'));
+    if (!recovered.length) return 'No successful fallback recovery was recorded for this run.';
+    const drill = f.events.some(e => e.type === 'fault_injection');
+    return `${recovered.map(e => e.worker).join(', ')} recovered through a fallback model and produced a candidate.${drill ? ' This was a labeled fault drill: primary failures were deliberately injected, not a provider outage.' : ' This is recorded model recovery.'} Full acceptance is still required for the selected candidate.`;
+  },
   speedup(f) {
     const r = acceptance(f);
     const screens = f.screens.filter((s) => typeof s.screen_median_speedup === 'number')
@@ -56,13 +76,12 @@ const answers = {
       + (f.terminal?.last_forwarded_candidate_id ? ` Forwarded to the verifier: ${f.terminal.last_forwarded_candidate_id}.` : '');
   },
   why_two(f) {
-    return `Two workers try different strategies in parallel so one weak idea does not decide the run, and each can fall back to a second model if its first fails. `
+    return `Two workers try different strategies so one weak idea does not decide the run. The current controller executes them sequentially, and each can fall back to a second model if its first fails. `
       + `This run used ${f.orders.length || 'no'} worker assignment${f.orders.length === 1 ? '' : 's'} (${list(f.orders.map((o) => o.worker))}). `
       + `Both are only candidates: everything still goes through the same screen, verifier and full acceptance.`;
   },
   zoo() {
-    return 'The cheating zoo is a separate defense test suite (planted attacks and honest controls), not part of this run or its result. '
-      + 'See the zoo section of the README and the separate suite for its own numbers.';
+    return 'The cheating zoo is a separate development defense pilot: 4/4 planted attacks were rejected and 4/4 honest controls passed. Those results are independent of this optimization run; replaying the animal scene does not run the suite again.';
   },
   cost(f) {
     const b = f.budget;

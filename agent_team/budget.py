@@ -7,6 +7,7 @@ default is unpriced (0.0) for fixtures, so live runs must supply `prices` or
 
 from dataclasses import dataclass
 import itertools
+import threading
 
 
 class BudgetExhausted(RuntimeError):
@@ -33,12 +34,17 @@ class Budget:
         self.usd_per_1k_tokens, self.prices = usd_per_1k_tokens, dict(prices or {})
         self.attempts_used, self.tokens_used, self.cost_used = 0, 0, 0.0
         self._open, self._ids = {}, itertools.count(1)
+        self._lock = threading.Lock()  # parallel workers/verifiers share one budget
 
     def _price(self, model_id):
         return self.prices.get(model_id, self.usd_per_1k_tokens)
 
     def reserve(self, tokens, *, model_id=None):
         """Count the attempt and hold tokens/cost now; raises before any model call."""
+        with self._lock:
+            return self._reserve(tokens, model_id)
+
+    def _reserve(self, tokens, model_id):
         if type(tokens) is not int or tokens <= 0:
             raise ValueError("tokens must be a positive integer")
         price = self._price(model_id)
@@ -59,6 +65,10 @@ class Budget:
 
     def settle(self, reservation, actual_tokens):
         """Replace the reservation with actual usage (refund unused; overrun is recorded)."""
+        with self._lock:
+            self._settle(reservation, actual_tokens)
+
+    def _settle(self, reservation, actual_tokens):
         if type(actual_tokens) is not int or actual_tokens < 0:
             raise ValueError("actual tokens must be a non-negative integer")
         if self._open.pop(reservation.reservation_id, None) is None:
@@ -67,6 +77,10 @@ class Budget:
         self.cost_used += (actual_tokens - reservation.tokens) * reservation.price / 1000
 
     def snapshot(self):
+        with self._lock:
+            return self._snapshot()
+
+    def _snapshot(self):
         priced = self.usd_per_1k_tokens > 0 or any(p > 0 for p in self.prices.values())
         return {"attempts_used": self.attempts_used, "tokens_used": self.tokens_used,
                 "cost_usd": self.cost_used, "open_reservations": len(self._open),
@@ -76,7 +90,8 @@ class Budget:
                 "max_tokens": self.max_tokens, "max_cost_usd": self.max_cost_usd}
 
     def check_limits(self):
-        if self.tokens_used > self.max_tokens:
-            raise BudgetExhausted("reported token usage exceeded the budget")
-        if self.cost_used > self.max_cost_usd:
-            raise BudgetExhausted("reported cost exceeded the budget")
+        with self._lock:
+            if self.tokens_used > self.max_tokens:
+                raise BudgetExhausted("reported token usage exceeded the budget")
+            if self.cost_used > self.max_cost_usd:
+                raise BudgetExhausted("reported cost exceeded the budget")

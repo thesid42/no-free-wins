@@ -3,6 +3,7 @@
 import ast
 from dataclasses import asdict
 import math
+import os
 from pathlib import Path
 import secrets
 from statistics import median
@@ -359,7 +360,7 @@ def evaluate_candidate(request):
     """B's drop-in API; one disposable machine per evaluation, serial timing."""
     if type(request) is not dict:
         raise ValueError("evaluation request must be a JSON object")
-    with _default_lock:
+    with _eval_slots():
         from .backend import verified_backend
         from .sessions import load_session
         session = load_session(request.get("session_id", ""))
@@ -373,4 +374,30 @@ def evaluate_candidate(request):
                            task=task).evaluate_candidate(request)
 
 
-_default_lock = threading.RLock()
+# Evaluations are independent: each owns its Harness, its sandbox and its output directory, and
+# timing pairs are matched within one machine. A bounded semaphore (default 2, NFW_MAX_PARALLEL_EVALS
+# 1..4) replaces the old global lock; with one caller the behavior is identical to serial.
+MAX_PARALLEL_EVALS_ENV = "NFW_MAX_PARALLEL_EVALS"
+DEFAULT_PARALLEL_EVALS = 2
+_slots, _slots_guard = None, threading.Lock()
+
+
+def max_parallel_evals(environ=None):
+    raw = (os.environ if environ is None else environ).get(MAX_PARALLEL_EVALS_ENV)
+    if raw is None or not raw.strip():
+        return DEFAULT_PARALLEL_EVALS
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        value = 0
+    if not 1 <= value <= 4:
+        raise ValueError(f"{MAX_PARALLEL_EVALS_ENV} must be an integer from 1 to 4")
+    return value
+
+
+def _eval_slots():
+    global _slots
+    with _slots_guard:
+        if _slots is None:
+            _slots = threading.BoundedSemaphore(max_parallel_evals())
+        return _slots

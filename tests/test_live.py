@@ -168,6 +168,7 @@ class BuildLiveRunTests(unittest.TestCase):
         client = client or ListingClient(run_script())
         kw.setdefault("evaluate", FakeEvaluate())
         kw.setdefault("session_id", "dev-session")
+        kw.setdefault("parallel", False)  # these fixtures share one model queue between workers
         return live.build_live_run(output_dir=self.output, client=client,
                                    available_ids=LIVE_IDS, **kw), client
 
@@ -284,7 +285,7 @@ class BuildLiveRunTests(unittest.TestCase):
         client = ListingClient(run_script())
         orchestrator, _ = live.build_live_run(
             session_id="dev-session", output_dir=self.output, client=client,
-            evaluate=FakeEvaluate(), available_ids=LIVE_IDS)
+            evaluate=FakeEvaluate(), available_ids=LIVE_IDS, parallel=False)
         orchestrator.run()
         self.assertEqual(set(client.max_tokens), {8192})
 
@@ -361,7 +362,7 @@ class PreflightTests(unittest.TestCase):
                     mock.patch.object(sessions, "load_session", logs_session):
                 orchestrator, _ = live.build_live_run(
                     session_id="s1", output_dir=Path(tmp) / "run", client=client,
-                    evaluate=evaluate, available_ids=LIVE_IDS)
+                    evaluate=evaluate, available_ids=LIVE_IDS, parallel=False)
                 result = orchestrator.run()
         self.assertEqual(result.state, "failed_infrastructure")
         self.assertEqual((client.calls, evaluate.calls), ([], []))
@@ -477,7 +478,7 @@ class RepoSessionTests(unittest.TestCase):
         client = ListingClient(run_script())
         return live.build_live_run(session_id="dev-session", output_dir=self.output, client=client,
                                    evaluate=kw.pop("evaluate", FakeEvaluate()),
-                                   available_ids=LIVE_IDS, **kw), client
+                                   available_ids=LIVE_IDS, parallel=False, **kw), client
 
     def test_build_uses_repo_task_id_summary_and_label(self):
         (orchestrator, info), _ = self.build()

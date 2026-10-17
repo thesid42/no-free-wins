@@ -54,6 +54,12 @@ export interface ReplayResult extends VerifiedResult {
   candidateId: string | null;
 }
 
+/** Verified excerpts and receipt measurements used only to animate a recorded replay. */
+export interface ReplayPresentation {
+  candidates: Record<string, string>;
+  pairTimings: Array<{ baselineSeconds: number; candidateSeconds: number; outputsMatch: true }>;
+}
+
 /** GET /api/health. `launch` is true only when the bridge can start analyses and runs. */
 export interface Health {
   ok: boolean;
@@ -99,6 +105,20 @@ export interface Job {
 }
 
 /** Every launch call sends `confirmSpend: true`; callers must only invoke them after an explicit user confirmation. */
+/** GET /api/zoo (available: true). Separate defense suite; not part of any optimization run. */
+export interface ZooReport {
+  available: true;
+  id: string;
+  measuredUtc: string;
+  surface: string | null;
+  sandboxDeleted: boolean;
+  attackCount: number;
+  attacksCaught: number;
+  honestCount: number;
+  honestPassed: number;
+  rows: { fixture: string; label: 'attack' | 'honest'; category: string; rejected: boolean; sourceSha256: string | null; proofSha256: string | null }[];
+}
+
 export interface PipelineAdapter {
   health(signal?: AbortSignal): Promise<Health>;
   runs(signal?: AbortSignal): Promise<RunSummary[]>;
@@ -106,7 +126,12 @@ export interface PipelineAdapter {
   result(runId: string, signal?: AbortSignal): Promise<ReplayResult>;
   chat(runId: string, message: string, signal?: AbortSignal): Promise<string>;
   artifactUrl(artifactId: string): string;
+  presentation(runId: string, signal?: AbortSignal): Promise<ReplayPresentation>;
+  /** Newest cheating-zoo report, or null when none is available. */
+  zoo(signal?: AbortSignal): Promise<ZooReport | null>;
+  source(artifactId: string, signal?: AbortSignal): Promise<string>;
   analyze(repoUrl: string, prompt: string, signal?: AbortSignal): Promise<{ jobId: string }>;
+  auto(repoUrl: string, prompt: string, signal?: AbortSignal): Promise<{ jobId: string; sessionPrefix?: string }>;
   answer(proposalId: string, text: string, signal?: AbortSignal): Promise<{ jobId: string }>;
   approve(proposalId: string, signal?: AbortSignal): Promise<{ jobId: string; sessionId?: string }>;
   job(jobId: string, signal?: AbortSignal): Promise<Job>;

@@ -3,8 +3,14 @@
 One controller owns the hash-chained official ledger. Harness and model client are injected.
 Model text never decides acceptance: only harness response fields do. Events carry ids,
 hashes, statuses and metrics, never messages or candidate source.
+
+With parallel=True a round overlaps independent work: both workers call their models at once,
+then every candidate is screened (one thread each) while its verifier reviews the code. Threads
+only compute; every ledger write, counter and id comes from the controller thread, in fixed
+worker/candidate order, after the threads finish. parallel=False is the original sequential path.
 """
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import math
@@ -76,7 +82,7 @@ class Orchestrator:
                  utcnow=_utcnow, new_id=lambda: uuid.uuid4().hex,
                  task_summary=roles.TASK_SUMMARY, playbook=None, annotations=(),
                  min_harness_seconds=None, preflight=None, max_tokens=4096,
-                 task_id="logs-parse-v1"):
+                 task_id="logs-parse-v1", parallel=False):
         if not callable(evaluate):
             raise ValueError("evaluate must be callable")
         if (type(orders) is not dict or set(orders) != ORDER_KEYS or
@@ -104,6 +110,9 @@ class Orchestrator:
             raise ValueError("max_tokens must be a positive integer")
         if preflight is not None and not callable(preflight):
             raise ValueError("preflight must be callable")
+        if type(parallel) is not bool:
+            raise ValueError("parallel must be a boolean")
+        self.parallel = parallel
         self.min_harness_seconds, self._preflight = dict(floors), preflight
         self.max_tokens, self.task_id = max_tokens, task_id
         self._evaluate_fn, self.client, self.budget = evaluate, client, budget
@@ -144,34 +153,62 @@ class Orchestrator:
                                   messages=messages, parse=parse, max_tokens=self.max_tokens,
                                   before_attempt=self._remaining, after_attempt=self._remaining)
 
+    def _harness_attempt(self, candidate, mode, new_request_id, verifier=None):
+        """One deadline-checked, validated harness call that touches no shared state and logs nothing.
+
+        Safe to run in a thread. Returns (response, pending_logs, error): response is the validated
+        reply (None when none arrived), pending_logs are (kind, fields) for the controller thread to
+        record, error is the exception the controller must raise (terminal on any infrastructure fault)."""
+        logs = []
+        try:
+            remaining = self._remaining()
+            if remaining < self.min_harness_seconds[mode]:
+                return None, logs, _Terminal("failed_deadline", f"insufficient time for {mode}")
+            request = contract.build_request(
+                request_id=f"req-{new_request_id()}", session_id=self.session_id, candidate=candidate,
+                mode=mode, remaining_wall_seconds=remaining, verifier=verifier, task_id=self.task_id)
+            try:
+                response = self._evaluate_fn(request)
+            except Exception as exc:
+                logs.append(("harness_error", {"candidate_id": candidate["candidate_id"], "mode": mode,
+                                               "error_type": type(exc).__name__}))
+                stop = _Terminal("failed_infrastructure", f"harness raised in {mode}")
+                stop.__cause__ = exc
+                return None, logs, stop
+            try:
+                contract.validate_response(response, request)
+            except ValueError as exc:
+                logs.append(("evidence_invalid", {"candidate_id": candidate["candidate_id"],
+                                                  "mode": mode}))
+                stop = _Terminal("failed_evidence", f"invalid {mode} response")
+                stop.__cause__ = exc
+                return None, logs, stop
+            try:
+                self._remaining()
+            except _Terminal as stop:
+                logs.append(("harness_returned_late", {
+                    "candidate_id": candidate["candidate_id"], "mode": mode,
+                    "receipt_sha256": response["receipt_sha256"],
+                    "response_sha256": digest(canonical_json(response))}))
+                return response, logs, stop
+            return response, logs, None
+        except Exception as exc:  # incl. _Terminal from the deadline check
+            return None, logs, exc
+
+    def _harness_apply(self, rnd, outcome):
+        """Controller thread only: record an attempt's responses and logs, then raise its error."""
+        response, logs, error = outcome
+        if response is not None:
+            self._responses.append(response)
+        for kind, fields in logs:
+            self._log(kind, rnd, **fields)
+        if error is not None:
+            raise error
+        return response
+
     def _harness(self, candidate, mode, rnd, verifier=None):
         """One deadline-checked, validated harness call; terminal on any infrastructure fault."""
-        remaining = self._remaining()
-        if remaining < self.min_harness_seconds[mode]:
-            raise _Terminal("failed_deadline", f"insufficient time for {mode}")
-        request = contract.build_request(
-            request_id=f"req-{self._new_id()}", session_id=self.session_id, candidate=candidate,
-            mode=mode, remaining_wall_seconds=remaining, verifier=verifier, task_id=self.task_id)
-        try:
-            response = self._evaluate_fn(request)
-        except Exception as exc:
-            self._log("harness_error", rnd, candidate_id=candidate["candidate_id"], mode=mode,
-                      error_type=type(exc).__name__)
-            raise _Terminal("failed_infrastructure", f"harness raised in {mode}") from exc
-        try:
-            contract.validate_response(response, request)
-        except ValueError as exc:
-            self._log("evidence_invalid", rnd, candidate_id=candidate["candidate_id"], mode=mode)
-            raise _Terminal("failed_evidence", f"invalid {mode} response") from exc
-        self._responses.append(response)
-        try:
-            self._remaining()
-        except _Terminal:
-            self._log("harness_returned_late", rnd, candidate_id=candidate["candidate_id"],
-                      mode=mode, receipt_sha256=response["receipt_sha256"],
-                      response_sha256=digest(canonical_json(response)))
-            raise
-        return response
+        return self._harness_apply(rnd, self._harness_attempt(candidate, mode, self._new_id, verifier))
 
     def _result_fields(self, candidate, response):
         return {"candidate_id": candidate["candidate_id"], "candidate_sha256": candidate["sha256"],
@@ -205,19 +242,38 @@ class Orchestrator:
                       description_sha256=digest(strategy["description"].encode("utf-8")),
                       primary=order.primary, fallback=order.fallback)
 
+    def _worker_call(self, worker, strategy, feedback):
+        """One worker's model order, exceptions captured so a thread never logs or raises."""
+        messages = roles.worker_messages(self.task_summary, strategy, feedback)
+        try:
+            return self._call(worker, messages, roles.parse_candidate), None
+        except Exception as exc:
+            return None, exc
+
     def _work(self, rnd):
         feedback = roles.public_feedback(self._responses) + [dict(c) for c in self._codes]
         new, failed = [], 0
         self._heartbeat("work", rnd)
-        for worker, strategy in self._workers:
-            messages = roles.worker_messages(self.task_summary, strategy, feedback)
-            try:
-                source, attempts = self._call(worker, messages, roles.parse_candidate)
-            except OrderFailed as exc:
+        if self.parallel:
+            with ThreadPoolExecutor(max_workers=len(self._workers)) as pool:
+                futures = [pool.submit(self._worker_call, worker, strategy, feedback)
+                           for worker, strategy in self._workers]
+                calls = [future.result() for future in futures]
+        else:
+            calls = None
+        for index, (worker, strategy) in enumerate(self._workers):
+            # Sequential: call now (a terminal stops before the next worker is called). Parallel: both
+            # already returned; results are handled here in worker order, so the first terminal wins.
+            result, error = calls[index] if calls is not None else self._worker_call(
+                worker, strategy, feedback)
+            if type(error) is OrderFailed:
                 failed += 1
                 self._log("worker_failed", rnd, worker=worker, strategy_id=strategy["strategy_id"][:64],
-                          attempts=exc.attempts)
+                          attempts=error.attempts)
                 continue
+            if error is not None:
+                raise error
+            source, attempts = result
             candidate = contract.make_candidate(f"{worker}-r{rnd}", source)
             if candidate["sha256"] in self._seen:
                 self._log("duplicate_candidate", rnd, worker=worker,
@@ -238,59 +294,131 @@ class Orchestrator:
             raise _Terminal("failed_no_candidates", "both workers failed in round 1")
         return new
 
+    def _screen_response(self, rnd, candidate, response, tally):
+        """The per-candidate screen rules, shared by the sequential and parallel paths."""
+        speedup = response["screen_median_speedup"]
+        self._log("screen_result", rnd, screen_median_speedup=speedup,
+                  **self._result_fields(candidate, response))
+        if response["status"] == "budget_exhausted":
+            # One candidate ran out of harness budget. Only terminal when the run itself
+            # could not screen another candidate anyway; otherwise it is that candidate's failure.
+            if self._remaining() < self.min_harness_seconds["screen"]:
+                raise _Terminal("failed_deadline", "harness budget exhausted in screen")
+            self._codes.append({"code": "evaluation_deadline"})
+            return
+        tally["evaluated"] += 1
+        if response["status"] == "infrastructure_error":
+            raise _Terminal("failed_infrastructure", "screen status infrastructure_error")
+        if (response["status"] == "screened" and response["correctness_passed"] and
+                speedup is not None and speedup >= self.screen_bar):
+            tally["qualifying"].append((candidate, response, speedup))
+
+    def _screen_finish(self, tally):
+        """Qualifying candidates, best first (highest speedup, first on ties); sets _best_response."""
+        ranked = sorted(tally["qualifying"], key=lambda item: -item[2])  # stable: first on ties
+        if not ranked:
+            if tally["evaluated"]:
+                self._codes.append({"code": "screen_below_bar"})
+            return []
+        self._best_response = ranked[0][1]
+        return ranked
+
     def _screen(self, rnd, new):
         self._heartbeat("screen", rnd)
-        best, evaluated = None, 0
+        tally = {"evaluated": 0, "qualifying": []}
         for candidate in new:
             response = self._harness(candidate, "screen", rnd)
-            speedup = response["screen_median_speedup"]
-            self._log("screen_result", rnd, screen_median_speedup=speedup,
-                      **self._result_fields(candidate, response))
-            if response["status"] == "budget_exhausted":
-                # One candidate ran out of harness budget. Only terminal when the run itself
-                # could not screen another candidate anyway; otherwise it is that candidate's failure.
-                if self._remaining() < self.min_harness_seconds["screen"]:
-                    raise _Terminal("failed_deadline", "harness budget exhausted in screen")
-                self._codes.append({"code": "evaluation_deadline"})
-                continue
-            evaluated += 1
-            if response["status"] == "infrastructure_error":
-                raise _Terminal("failed_infrastructure", "screen status infrastructure_error")
-            if (response["status"] == "screened" and response["correctness_passed"] and
-                    speedup is not None and speedup >= self.screen_bar and
-                    (best is None or speedup > best[2])):
-                best = (candidate, response, speedup)
-        if best is None:
-            if evaluated:
-                self._codes.append({"code": "screen_below_bar"})
-            return None
-        self._best_response = best[1]
-        return best[0]
+            self._screen_response(rnd, candidate, response, tally)
+        ranked = self._screen_finish(tally)
+        return ranked[0][0] if ranked else None
 
-    def _verify(self, rnd, candidate):
-        """Return the controller-minted verdict id, or None when rejected."""
-        self._heartbeat("verify", rnd)
+    def _verify_call(self, candidate):
+        """The verifier's review of one candidate: ("approved"|"rejected"|"failed", data) or raises.
+        Reads only the code and sha, so it is safe to run in a thread; it logs nothing."""
         sha = candidate["sha256"]
-        fields = {"candidate_id": candidate["candidate_id"], "candidate_sha256": sha}
-        self._forwarded = candidate
         try:
             verdict, attempts = self._call(
                 "verifier", roles.verifier_messages(self.task_summary, candidate["source_utf8"], sha),
                 lambda text: roles.parse_verdict(text, sha))
         except OrderFailed as exc:
-            self._log("verifier_verdict", rnd, approved=False, verifier_failed=True,
-                      attempts=exc.attempts, **fields)
-            self._codes.append({"code": "verifier_rejected"})
-            return None
+            return "failed", exc.attempts
         if verdict["approved"] is not True:
-            self._log("verifier_verdict", rnd, approved=False, mismatch=bool(verdict.get("mismatch")),
-                      attempts=attempts, **fields)
+            return "rejected", (bool(verdict.get("mismatch")), attempts)
+        return "approved", attempts
+
+    def _verify(self, rnd, candidate):
+        """Return the controller-minted verdict id, or None when rejected."""
+        self._heartbeat("verify", rnd)
+        self._forwarded = candidate
+        verdict_id = self._record_verdict(rnd, candidate, self._verify_call(candidate))
+        if verdict_id is None:
             self._codes.append({"code": "verifier_rejected"})
+        return verdict_id
+
+    def _record_verdict(self, rnd, candidate, outcome):
+        """Controller thread only: log one verdict; the verdict id is minted for approvals only."""
+        kind, data = outcome
+        fields = {"candidate_id": candidate["candidate_id"], "candidate_sha256": candidate["sha256"]}
+        if kind == "failed":
+            self._log("verifier_verdict", rnd, approved=False, verifier_failed=True,
+                      attempts=data, **fields)
+            return None
+        if kind == "rejected":
+            mismatch, attempts = data
+            self._log("verifier_verdict", rnd, approved=False, mismatch=mismatch,
+                      attempts=attempts, **fields)
             return None
         verdict_id = f"verdict-{self._new_id()}"
         self._log("verifier_verdict", rnd, approved=True, mismatch=False, verdict_id=verdict_id,
-                  attempts=attempts, **fields)
+                  attempts=data, **fields)
         return verdict_id
+
+    def _screen_and_verify(self, rnd, new):
+        """Parallel round: screen every candidate and run each one's verifier at the same time.
+
+        Returns (candidate, verdict_id) for the best screened, correct, above-bar candidate the
+        verifier approved, or None. Threads compute only; this thread logs, in candidate order."""
+        self._heartbeat("screen", rnd)
+        request_ids = [f"{self._new_id()}" for _ in new]  # minted here, in candidate order
+        with ThreadPoolExecutor(max_workers=2 * len(new)) as pool:
+            screens = [pool.submit(self._harness_attempt, candidate, "screen",
+                                   lambda rid=rid: rid)
+                       for candidate, rid in zip(new, request_ids)]
+            verifiers = [pool.submit(self._verify_thread, candidate) for candidate in new]
+            screened = [future.result() for future in screens]
+            reviewed = [future.result() for future in verifiers]
+        tally = {"evaluated": 0, "qualifying": []}
+        for candidate, outcome in zip(new, screened):
+            response = self._harness_apply(rnd, outcome)
+            self._screen_response(rnd, candidate, response, tally)
+        ranked = self._screen_finish(tally)
+        if ranked:
+            self._heartbeat("verify", rnd)
+        # Every verdict is logged in candidate order; only approvals get a minted id.
+        verdict_ids = {}
+        for candidate, (outcome, error) in zip(new, reviewed):
+            if error is None:
+                verdict_ids[candidate["candidate_id"]] = self._record_verdict(rnd, candidate, outcome)
+        chosen = None
+        for candidate, response, _ in ranked:
+            self._forwarded = candidate
+            outcome, error = reviewed[new.index(candidate)]
+            if error is not None:
+                raise error  # the verifier this candidate needed hit a terminal or budget stop
+            verdict_id = verdict_ids[candidate["candidate_id"]]
+            if verdict_id is None:
+                self._codes.append({"code": "verifier_rejected"})
+                continue
+            chosen = (candidate, verdict_id)
+            self._best_response = response
+            break
+        return chosen
+
+    def _verify_thread(self, candidate):
+        try:
+            return self._verify_call(candidate), None
+        except Exception as exc:
+            return None, exc
 
     def _accept(self, rnd, candidate, verdict_id):
         self._heartbeat("acceptance", rnd)
@@ -333,12 +461,18 @@ class Orchestrator:
             if not new:
                 self._codes.append({"code": "no_new_candidate"})
                 continue
-            best = self._screen(rnd, new)
-            if best is None:
-                continue
-            verdict_id = self._verify(rnd, best)
-            if verdict_id is None:
-                continue
+            if self.parallel:
+                chosen = self._screen_and_verify(rnd, new)
+                if chosen is None:
+                    continue
+                best, verdict_id = chosen
+            else:
+                best = self._screen(rnd, new)
+                if best is None:
+                    continue
+                verdict_id = self._verify(rnd, best)
+                if verdict_id is None:
+                    continue
             self._accept(rnd, best, verdict_id)
         raise _Terminal("rounds_exhausted", f"no acceptance after {self.max_rounds} rounds")
 
