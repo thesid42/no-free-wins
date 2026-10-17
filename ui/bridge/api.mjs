@@ -5,7 +5,7 @@ import { open, readdir, realpath, stat } from 'node:fs/promises';
 import { dirname, join, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
-import { buildProof, buildResult, chatFacts, summarize, verificationOf } from './facts.mjs';
+import { buildPresentation, buildProof, buildResult, chatFacts, summarize, verificationOf } from './facts.mjs';
 import { chatReply } from './chat.mjs';
 import { mapEvent } from './mapping.mjs';
 
@@ -288,10 +288,11 @@ export function createApi({ repoRoot, runsRoot, python = defaultPython(repoRoot)
       if (method !== 'GET' && method !== 'HEAD') { req.resume(); fail(res, 405, 'method not allowed', { Allow: 'GET, HEAD' }); return true; }
       if (area === 'health' && parts.length === 2) send(res, 200, { ok: true, mode: 'replay', runsRoot: runsLabel }, {}, method);
       else if (area === 'runs' && parts.length === 2) await listRuns(res, method);
-      else if (area === 'runs' && parts.length === 4 && ['events', 'result'].includes(b)) {
+      else if (area === 'runs' && parts.length === 4 && ['events', 'result', 'presentation'].includes(b)) {
         const found = await resolveRun(a);
         if (!found) fail(res, 404, 'not found');
         else if (b === 'events') await streamEvents(req, res, found, url);
+        else if (b === 'presentation') send(res, 200, buildPresentation(a, await inspectRun(found)), {}, method);
         else send(res, 200, buildResult(a, await inspectRun(found)), {}, method);
       } else if (area === 'artifacts' && parts.length === 3) {
         const colon = a.lastIndexOf(':');

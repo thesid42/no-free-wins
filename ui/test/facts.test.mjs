@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { buildResult, summarize, verificationOf } from '../bridge/facts.mjs';
+import { buildPresentation, buildResult, summarize, verificationOf } from '../bridge/facts.mjs';
 
 const SHA = 'a'.repeat(64);
 const accepted = (receiptId) => ({ type: 'acceptance_result', accepted: true, origin: 'measured', candidate_id: 'w-r1', candidate_sha256: SHA, receipt_id: receiptId, receipt_sha256: SHA });
@@ -49,4 +49,22 @@ test('official label is an explicit allowlist', () => {
   for (const id of ['official-20261017-1', 'official-20261017-2', 'official-20261017-3']) assert.match(label(id), /^Official session \(recorded in PREP\.md section 8/);
   assert.equal(label('official-20261017-4'), 'ledger text');
   assert.equal(label('dev-1'), 'ledger text');
+});
+
+test('visual pair replay requires the matching audited accepted receipt', () => {
+  const audit = { valid: true, decision, pairTimings: [{ baselineSeconds: 0.3, candidateSeconds: 0.04, outputsMatch: true }] };
+  assert.equal(buildPresentation('r', inspected({ receiptAudit: audit })).pairTimings.length, 1);
+  for (const overrides of [{ receiptId: 'wrong' }, { ledgerVerified: false }, { receiptAudit: { ...audit, valid: false } }]) {
+    assert.deepEqual(buildPresentation('r', inspected({ receiptAudit: audit, ...overrides })).pairTimings, []);
+  }
+});
+
+test('presentation withholds unverified code and unusable timing values', () => {
+  assert.deepEqual(Object.keys(buildPresentation('r', inspected({ ledgerVerified: false, candidatePreviews: { c: 'def solve(x): return x' } })).candidates), []);
+  const result = buildPresentation('r', inspected({ receiptAudit: { valid: true, decision, pairTimings: [
+    { baselineSeconds: -1, candidateSeconds: 1, outputsMatch: true },
+    { baselineSeconds: 1, candidateSeconds: 0.2, outputsMatch: false },
+    { baselineSeconds: 1, candidateSeconds: NaN, outputsMatch: true },
+  ] } }));
+  assert.deepEqual(result.pairTimings, []);
 });

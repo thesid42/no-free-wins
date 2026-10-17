@@ -4,6 +4,7 @@
 import { codeBytes, proof, phaseNames, phaseNotes } from './demo-data.js';
 import { render } from './scenes.js';
 import { createAdapter } from './adapter.js';
+import { lineDiff, milestone } from './presentation.js';
 
 const adapter = createAdapter();
 const STAGE_PHASE = { analyze: 1, workers: 2, verify: 3, race: 4, zoo: 5, result: 6 };
@@ -11,10 +12,10 @@ const SPEED_PARAM = { 1: 1, 8: 8, instant: 0 };
 const LAUNCH_NOTE = 'Launching from a link is coming next; choose a recorded run.';
 const NOTICE = {
   checking: 'Checking for the local backend…',
-  up: 'Connected · replaying recorded runs from this machine’s ledgers. A replay is a recording, not a new run. Nothing is launched and links are never fetched.',
+  up: 'Replay saved evidence. Explore the code and the proof. No new run starts here.',
   down: 'Demo mode · local scenes and scripted chat. Backend disconnected. Links are never fetched.',
 };
-const BADGE = { checking: 'Checking backend…', up: 'Connected · replaying recorded runs', down: 'Demo mode · backend disconnected' };
+const BADGE = { checking: 'Connecting…', up: 'Recorded replay', down: 'Example mode' };
 
 const app = document.querySelector('[data-app="sidecar"]');
 const input = app.querySelector('textarea');
@@ -29,7 +30,6 @@ const view = {
   sourceOpen: true,
   playing: false,
   timer: null,
-  options: { renderer: 'Line graph' },
   api: 'checking',
   runs: [],
   runsError: '',
@@ -67,7 +67,7 @@ function applyMode() {
   app.querySelector('.demo-badge').textContent = BADGE[view.api];
   app.querySelector('.demo-notice').textContent = NOTICE[view.api];
   app.querySelector('.chat-hint').textContent = view.api === 'up'
-    ? 'Answers come from the recorded run’s data · Enter to send · Shift+Enter for a new line'
+    ? 'Ask while the replay runs · answers use recorded evidence'
     : 'Local scripted replies · Enter to send · Shift+Enter for a new line';
   note.textContent = LAUNCH_NOTE;
   note.hidden = view.api !== 'up';
@@ -106,6 +106,7 @@ function addMessage(role, text, speakerText = '✳ No Free Wins · demo', extra 
   article.append(body);
   messages.append(article);
   conversation.scrollTop = conversation.scrollHeight;
+  return article;
 }
 
 // ---- recorded-run replay -----------------------------------------------------------------
@@ -122,6 +123,10 @@ function newRun(meta) {
     terminal: null,
     result: null,
     resultState: 'idle',
+    milestones: new Set(),
+    race: { current: 0, total: 0, playing: false },
+    changes: { open: false, state: 'idle' },
+    presentation: { candidates: {}, pairTimings: [] },
     error: '',
     data: {
       sessionId: meta.sessionId, models: null, maxRounds: null, deadline: null, label: '', faults: [],
@@ -162,9 +167,15 @@ function applyEvent(run, event) {
       const c = candidate(x.candidate_id);
       if (w && c) {
         Object.assign(w, { candidateId: x.candidate_id, sha: text(x.candidate_sha256), attempts: Array.isArray(x.attempts) ? x.attempts : [] });
+        delete w.visualAttempt;
         w.strategyId = text(x.strategy_id) || w.strategyId;
         Object.assign(c, { worker: x.worker, sha: w.sha, strategyId: w.strategyId });
       }
+      break;
+    }
+    case 'worker_failed': {
+      const w = worker(x.worker);
+      if (w) Object.assign(w, { failed: true, attempts: x.attempts || [] });
       break;
     }
     case 'screen_result':
@@ -193,14 +204,18 @@ function clearReplayMessages() {
 
 function onEvent(run, event) {
   const known = Object.hasOwn(STAGE_PHASE, event.stage);
+  run.lastStage = event.stage;
   applyEvent(run, event);
   if (event.kind === 'acceptance_result' && run.resultState === 'idle') fetchResult(run).then(() => { if (view.run === run) refresh(); });
   if (known) {
     run.seen.add(event.stage);
     if (event.status === 'failed') run.failed.add(event.stage);
   }
-  const message = typeof event.message === 'string' ? event.message.slice(0, 400) : '';
-  if (message) addMessage('agent', message, `✳ Replay · ${known ? event.stage : 'run'}`, 'replay-event');
+  const message = milestone(event.stage);
+  if (message && !run.milestones.has(event.stage)) {
+    run.milestones.add(event.stage);
+    addMessage('agent', message, '✳ No Free Wins · replay', 'replay-event');
+  }
   if (view.follow && known && view.phase !== STAGE_PHASE[event.stage]) go(STAGE_PHASE[event.stage], true);
   else refresh();
 }
@@ -229,6 +244,10 @@ async function replay(meta) {
   stop();
   chatController?.abort();
   const run = newRun(meta);
+  run.presentationPromise = adapter.presentation(meta.runId, run.controller.signal).then(
+    data => { run.presentation = data; if (view.run === run) refresh(); },
+    () => {},
+  );
   view.run = run;
   view.follow = true;
   view.sourceOpen = false;
@@ -241,7 +260,18 @@ async function replay(meta) {
     const options = { speed: SPEED_PARAM[view.speed], onEnd: (state) => { run.endState = state; } };
     for await (const event of adapter.events(meta.runId, run.controller.signal, options)) {
       if (view.run !== run) return;
+      if (event.kind === 'candidate_created') await showAttempts(run, event);
+      if (run.controller.signal.aborted || view.run !== run) return;
       onEvent(run, event);
+      if (event.kind === 'acceptance_result') {
+        await run.presentationPromise;
+        await run.resultPromise;
+        await replayPairs(run);
+        if (view.follow && view.speed !== 'instant' && !run.controller.signal.aborted) {
+          go(5, true);
+          await delay(1600, run.controller.signal);
+        }
+      }
     }
     if (run.controller.signal.aborted) {
       if (view.run === run) run.status = 'stopped';
@@ -256,6 +286,66 @@ async function replay(meta) {
     run.error = failure instanceof Error ? failure.message : 'unknown error';
     go(view.phase, false);
   }
+}
+
+function delay(ms, signal) {
+  return new Promise(resolve => {
+    if (signal.aborted || ms <= 0) return resolve();
+    const finish = () => { clearTimeout(timer); signal.removeEventListener('abort', finish); resolve(); };
+    const timer = setTimeout(finish, ms);
+    signal.addEventListener('abort', finish, { once: true });
+  });
+}
+
+async function showAttempts(run, event) {
+  const attempts = event.detail?.attempts || [];
+  if (attempts.length < 2 || view.speed === 'instant') return;
+  const key = event.detail.worker;
+  const worker = run.data.workers[key];
+  if (!worker) return;
+  for (const attempt of attempts) {
+    if (run.controller.signal.aborted || view.run !== run) return;
+    worker.visualAttempt = attempt;
+    if (view.follow) go(2, true); else refresh();
+    await delay(view.speed === 1 ? 1000 : 550, run.controller.signal);
+  }
+}
+
+async function replayPairs(run) {
+  const pairs = run.presentation.pairTimings || [];
+  if (!run.result?.accepted || !pairs.length || run.race.playing) return;
+  run.race.total = pairs.length;
+  if (view.speed === 'instant') { run.race.current = pairs.length; refresh(); return; }
+  run.race.playing = true;
+  for (let i = 0; i < pairs.length; i++) {
+    if (run.controller.signal.aborted || view.run !== run) break;
+    run.race.current = i + 1;
+    run.race.pair = pairs[i];
+    run.race.windowMs = view.speed === 1 ? 1000 : 420;
+    if (view.follow) go(4, true); else refresh();
+    await delay(run.race.windowMs + 60, run.controller.signal);
+  }
+  run.race.playing = false;
+  if (view.run === run) refresh();
+}
+
+async function showChanges() {
+  const run = view.run;
+  if (!run?.result?.accepted) return;
+  run.changes.open = !run.changes.open;
+  if (run.changes.state === 'idle') {
+    run.changes.state = 'loading';
+    refresh();
+    try {
+      const [original, optimized] = await Promise.all([
+        adapter.source(run.result.originalArtifactId, run.controller.signal),
+        adapter.source(run.result.optimizedArtifactId, run.controller.signal),
+      ]);
+      run.changes.diff = lineDiff(original, optimized);
+      run.changes.state = 'ready';
+    } catch { run.changes.state = 'error'; }
+  }
+  if (view.run === run) refresh();
 }
 
 async function loadRuns() {
@@ -412,9 +502,20 @@ app.addEventListener('click', (event) => {
     } else startExample();
   } else if (button.hasAttribute('data-example')) {
     startExample();
-  } else if (button.hasAttribute('data-renderer')) {
-    view.options.renderer = view.options.renderer === 'ASCII' ? 'Line graph' : 'ASCII';
+  } else if (button.hasAttribute('data-changes')) {
+    showChanges();
+  } else if (button.hasAttribute('data-pairs')) {
+    const run = view.run;
+    if (run) { view.follow = true; run.race.current = 0; replayPairs(run); }
+  } else if (button.hasAttribute('data-proof')) {
+    const owner = view.run || view;
+    owner.proofOpen = !owner.proofOpen;
     render(view, false);
+  } else if (button.hasAttribute('data-zoo')) {
+    go(5, true);
+  } else if (button.hasAttribute('data-follow')) {
+    view.follow = true;
+    go(STAGE_PHASE[view.run.lastStage] || view.phase, true);
   } else if (button.hasAttribute('data-question')) {
     chat(button.dataset.question);
   } else if (button.hasAttribute('data-download')) {

@@ -101,7 +101,7 @@ python -m agent_team run --session-id my-agent-dev --max-cost-usd 1 --max-rounds
 
 ## Sidecar UI preview
 
-The selected interface has chat on the left and a pipeline canvas on the right. The standalone skeleton includes link/instruction input, seven stage views (start, analysis, workers, verification, timing race, cheating zoo, result), replay/pause, an ASCII view, and example code/proof downloads. Chat stays available during replay. Narrow screens stack the pipeline above the conversation; light/dark themes and reduced motion follow system preferences.
+The selected interface has chat on the left and a pipeline canvas on the right. It includes seven stage views (start, analysis, workers, verification, timing race, cheating zoo, result), a line graph with animated handoffs, recorded fallback recovery, candidate source excerpts, replay/pause, and code/proof downloads. ASCII mode has been removed. Chat stays available with one milestone per major stage and contextual questions. Narrow screens stack the pipeline above the conversation; light/dark themes and reduced motion follow system preferences.
 
 Use Node.js 22 or newer on Windows or macOS. No npm dependencies or API keys are needed:
 
@@ -113,6 +113,8 @@ npm run dev
 Open `http://127.0.0.1:5173`. Run `npm run check` for JavaScript syntax checks.
 
 **Replay integration (event-built, development).** When `npm run dev` is started from this repository, `ui/server.mjs` also serves a local-only API (127.0.0.1, same-origin, read-only) over this machine's `artifacts/runs/` ledgers: a recorded-runs list, ledger events streamed into the seven scenes, results taken from audited receipts, downloads of the optimized code, original code and proof, and chat answers templated from the run's real data (no model calls). A replay is a recording, not a new run. Launching runs, analyst questions and approval from the UI are not connected yet; the link box only explains this. Without the API the page falls back to the original scripted demo. `npm test` runs the bridge tests.
+
+The race can replay the actual 30 measured pairs from an audited accepted receipt, showing the stored durations and matched-output status. It never invents progress when only an aggregate result is available. The zoo is a separate recorded development pilot, not an acceptance stage of the selected run. Results include a bounded source diff and an expandable proof panel. Replaying these scenes starts no model calls or sandbox jobs.
 
 ## Optimize your own repo (development)
 

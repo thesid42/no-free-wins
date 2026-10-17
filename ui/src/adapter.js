@@ -67,6 +67,14 @@ export function createAdapter() {
     result(runId, signal) {
       return request(`${runPath(runId)}/result`, { signal });
     },
+    presentation(runId, signal) {
+      return request(`${runPath(runId)}/presentation`, { signal });
+    },
+    async source(artifactId, signal) {
+      const response = await fetch(this.artifactUrl(artifactId), { cache: 'no-store', signal });
+      if (!response.ok) throw new Error('Source unavailable');
+      return response.text();
+    },
     async chat(runId, message, signal) {
       const body = await request(`${runPath(runId)}/chat`, {
         method: 'POST',

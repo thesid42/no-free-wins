@@ -59,6 +59,12 @@ export interface ReplayResult extends VerifiedResult {
   candidateId: string | null;
 }
 
+/** Verified excerpts and receipt measurements used only to animate a recorded replay. */
+export interface ReplayPresentation {
+  candidates: Record<string, string>;
+  pairTimings: Array<{ baselineSeconds: number; candidateSeconds: number; outputsMatch: true }>;
+}
+
 export interface PipelineAdapter {
   start(request: RunRequest, signal: AbortSignal): Promise<{ runId: string }>;
   events(runId: string, signal: AbortSignal): AsyncIterable<PipelineEvent>;
