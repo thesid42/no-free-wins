@@ -52,6 +52,7 @@ PREPARE_TIMEOUT_SECONDS = 900
 MAX_ERROR_CHARS = 2000
 MAX_QUESTION_TEXT_CHARS = 5200  # up to 10 questions of 500 characters
 PREPARE_GRACE_SECONDS = 60
+CLEANUP_TIMEOUT_SECONDS = 120
 LOCK_NAME = ".lock"
 STATE_VERSION = 1
 
@@ -73,7 +74,7 @@ The target must therefore satisfy ALL of these hard constraints:
   from `size` and keep every input at or below about 600 KB, so choose sizes and element lengths
   accordingly.
 - On the timing inputs the ORIGINAL function should take roughly 0.1 to 0.5 second per call (hard
-  limit: the median must stay under 1 second), so that a 3x speedup is measurable. Estimate the
+  limit: the median must stay under 1 second), so that a speedup is reliably measurable. Estimate the
   cost of the original code and choose timing_size (the size argument of your generator) to land
   there, while still respecting the input size limit above.
 - State briefly in the description what `size` means (for example "size = number of lines").
@@ -716,6 +717,17 @@ def _run_prepare(command, timeout, grace):
     raise subprocess.TimeoutExpired(command, timeout)
 
 
+def _run_cleanup(timeout=CLEANUP_TIMEOUT_SECONDS):
+    """Backstop after a failed prepare: delete any sandbox it left behind. Returns "ok" or
+    "failed" and never raises."""
+    try:
+        done = subprocess.run([sys.executable, "-m", "optimizer_core", "cleanup"],
+                              cwd=PROJECT_ROOT, capture_output=True, text=True, timeout=timeout)
+        return "ok" if done.returncode == 0 else "failed"
+    except Exception:
+        return "failed"
+
+
 def approve(proposal_id, *, session_id, proposals_root=DEFAULT_PROPOSALS_ROOT, now=_utc_now,
             timeout=PREPARE_TIMEOUT_SECONDS, grace=PREPARE_GRACE_SECONDS):
     """Run the sandboxed prepare-repo for an approved proposal (repo code never runs locally).
@@ -742,12 +754,13 @@ def approve(proposal_id, *, session_id, proposals_root=DEFAULT_PROPOSALS_ROOT, n
         except subprocess.TimeoutExpired:
             failure = (f"prepare-repo timed out after {timeout:g} seconds and was interrupted; a "
                        "sandbox may be left running, so run `python -m optimizer_core cleanup`")
+        cleanup = _run_cleanup() if failure is not None else None
         state = _load(proposals_root, proposal_id)  # never save the pre-subprocess copy
         if state["status"] != "proposal":
             raise ProposalError(f"proposal {proposal_id} changed to status {state['status']} while "
                                 f"preparing; session {session_id} may have been prepared")
         if failure is not None:
-            state["history"].append({"prepare_error": failure})
+            state["history"].append({"prepare_error": failure, "cleanup": cleanup})
             state["updated_at"] = now()
             _save(directory, state)
             return {"status": "prepare_failed", "error": failure}

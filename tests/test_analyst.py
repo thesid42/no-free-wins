@@ -92,6 +92,11 @@ class AnalystCase(unittest.TestCase):
         self.proposals = Path(self.tmp.name) / "proposals"
         self.snapshots = Path(self.tmp.name) / "snapshots"
         self.ids = iter(["prop1", "prop2", "prop3"])
+        # approve() runs the live `optimizer_core cleanup` backstop after a failed prepare: never
+        # let a test reach it unless it mocks subprocess itself.
+        patcher = mock.patch.object(analyst, "_run_cleanup", return_value="ok")
+        self.run_cleanup = patcher.start()
+        self.addCleanup(patcher.stop)
 
     def use_repo_task(self, **kw):
         self.repo_task = fake_repo_task(self.repo, **kw)
@@ -601,6 +606,9 @@ class MalformedAndBudgetTests(AnalystCase):
             self.assertIn(needle, text)
 
 
+analyst_real_cleanup = analyst._run_cleanup  # captured before setUp patches the module attribute
+
+
 def child_script(body):
     return [sys.executable, "-c", "import signal, sys, time\n" + body]
 
@@ -644,7 +652,7 @@ class ApproveTests(AnalystCase):
         self.assertEqual(result, {"status": "prepare_failed", "error": error})
         state = self.state()
         self.assertEqual(state["status"], "proposal")
-        self.assertEqual(state["history"], [{"prepare_error": error}])
+        self.assertEqual(state["history"], [{"prepare_error": error, "cleanup": "ok"}])
         self.assertIsNone(state["session_id"])
         again = self.cont([questions_reply("Can the target avoid dict ordering?")],
                           "it sorts keys already")
@@ -666,7 +674,7 @@ class ApproveTests(AnalystCase):
         self.assertNotIn(str(analyst.PROJECT_ROOT), error)
         self.assertNotIn(home, error)
         self.assertIn("~/secret/dir", error)
-        self.assertEqual(self.state()["history"], [{"prepare_error": error}])
+        self.assertEqual(self.state()["history"], [{"prepare_error": error, "cleanup": "ok"}])
 
     def test_timeout_is_a_prepare_failure_pointing_at_cleanup(self):
         self.start([proposal_reply()])
@@ -675,6 +683,38 @@ class ApproveTests(AnalystCase):
         self.assertEqual(result["status"], "prepare_failed")
         self.assertIn("timed out", result["error"])
         self.assertIn("python -m optimizer_core cleanup", result["error"])
+        self.run_cleanup.assert_called_once_with()
+        self.assertEqual(self.state()["history"][-1]["cleanup"], "ok")
+
+    def test_failed_prepare_runs_the_cleanup_command_in_the_project_root(self):
+        self.start([proposal_reply()])
+        done = mock.Mock(returncode=0, stdout="[]", stderr="")
+        with mock.patch.object(analyst, "_run_cleanup", analyst_real_cleanup), \
+                mock.patch.object(analyst.subprocess, "run", return_value=done) as run, \
+                self.run_prepare((1, "", "generator hit its output_limit limit")):
+            result = analyst.approve("prop1", session_id="s1", proposals_root=self.proposals)
+        self.assertEqual(result["status"], "prepare_failed")
+        (command,), kwargs = run.call_args
+        self.assertEqual(command, [sys.executable, "-m", "optimizer_core", "cleanup"])
+        self.assertEqual((kwargs["cwd"], kwargs["timeout"]), (analyst.PROJECT_ROOT, 120))
+        self.assertEqual(self.state()["history"],
+                         [{"prepare_error": "generator hit its output_limit limit",
+                           "cleanup": "ok"}])
+
+    def test_cleanup_failures_are_recorded_and_never_raise(self):
+        for outcome in (mock.Mock(returncode=1, stdout="", stderr="boom"),
+                        subprocess.TimeoutExpired("x", 120), OSError("no python")):
+            with self.subTest(outcome=outcome):
+                kw = ({"side_effect": outcome} if isinstance(outcome, BaseException)
+                      else {"return_value": outcome})
+                with mock.patch.object(analyst.subprocess, "run", **kw):
+                    self.assertEqual(analyst_real_cleanup(), "failed")
+
+    def test_successful_prepare_does_not_run_cleanup(self):
+        self.start([proposal_reply()])
+        with self.run_prepare((0, json.dumps({"session_id": "s1"}), "")):
+            analyst.approve("prop1", session_id="s1", proposals_root=self.proposals)
+        self.run_cleanup.assert_not_called()
 
     def test_timeout_interrupts_a_slow_child_with_sigint_before_any_kill(self):
         marker = Path(self.tmp.name) / "interrupted"
@@ -782,7 +822,8 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config["models"]["analyst"], ("deepseek-ai/DeepSeek-V4.1-Flash", "openai/gpt-oss-120b"))
         self.assertEqual(config["models"]["verifier"], ("glm-5.3-flash", "deepseek-v4-flash"))
         self.assertEqual(config["run"], {"deadline_seconds": 1800, "max_rounds": 2, "max_cost_usd": 5,
-                                         "max_tokens_per_call": 8192, "parallel": True})
+                                         "max_tokens_per_call": 8192, "parallel": True,
+                                         "screen_bar": 1.0})
         self.assertEqual(config["analysis"], {"max_cost_usd": 1, "max_question_rounds": 5,
                                               "max_tokens_per_call": 8192})
         self.assertEqual(config["repo"], {"include": "full", "timing_size": 40000,

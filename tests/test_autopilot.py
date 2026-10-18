@@ -40,7 +40,7 @@ SCREEN_EVENTS = [
     {"type": "candidate_created", "round": 1, "candidate_id": "worker_a-r1",
      "strategy_id": "single-pass"},
     {"type": "screen_result", "round": 1, "candidate_id": "worker_a-r1", "status": "screened",
-     "correctness_passed": True, "screen_median_speedup": 1.4},
+     "correctness_passed": True, "screen_median_speedup": 0.9},
     {"type": "verifier_verdict", "round": 2, "candidate_id": "worker_a-r2", "approved": False},
     {"type": "terminal", "round": 2, "state": "rounds_exhausted",
      "reason": "no acceptance after 2 rounds", "last_forwarded_candidate_id": None}]
@@ -199,7 +199,7 @@ class PipelineTests(AutopilotCase):
         lessons = second["extra_summary"]
         self.assertTrue(lessons.startswith("Lessons from the previous attempt: "))
         for needle in ("rounds_exhausted", "no acceptance after 2 rounds", "worker_a-r1",
-                       "screen speedup 1.4", "screen_below_bar", "verifier_rejected"):
+                       "screen speedup 0.9", "screen_below_bar", "verifier_rejected"):
             self.assertIn(needle, lessons)
         self.assertLessEqual(len(lessons), autopilot.MAX_LESSONS_CHARS + 40)
         self.assertNotEqual(first["output_dir"], second["output_dir"])

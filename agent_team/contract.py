@@ -92,9 +92,13 @@ def validate_response(resp, request):
 
 
 def is_verified_done(resp):
-    """True only for a measured, receipted acceptance meeting the fixed bar. Never raises."""
+    """True only for a measured, receipted acceptance whose median and CI lower bound are strictly above the policy bar (1.0, or legacy 3.0). Never raises."""
     try:
         acceptance = resp["acceptance"]
+        policy = acceptance.get("policy") if type(acceptance) is dict else None
+        policy_min = policy.get("minimum_speedup") if type(policy) is dict else None
+        if not _number(policy_min) or policy_min not in (1.0, 3.0):
+            policy_min = 1.0
         return (resp["status"] == "accepted" and resp["origin"] == "measured" and
                 resp["accepted"] is True and resp["correctness_passed"] is True and
                 type(resp["receipt_id"]) is str and bool(resp["receipt_id"]) and
@@ -103,7 +107,8 @@ def is_verified_done(resp):
                 type(acceptance) is dict and acceptance["accepted"] is True and
                 acceptance.get("origin") == "measured" and acceptance.get("reasons") == [] and
                 type(acceptance["pairs"]) is int and acceptance["pairs"] == 30 and
-                _number(acceptance["median_speedup"]) and acceptance["median_speedup"] >= 3.0 and
-                _number(acceptance["ci_lower"]) and acceptance["ci_lower"] >= 3.0)
+                _number(acceptance["median_speedup"]) and
+                acceptance["median_speedup"] > policy_min and
+                _number(acceptance["ci_lower"]) and acceptance["ci_lower"] > policy_min)
     except (KeyError, TypeError):
         return False

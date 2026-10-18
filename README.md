@@ -17,7 +17,7 @@ Status as of October 17, 2026:
 | A: deterministic harness | Implemented and validated |
 | Daytona execution | Live isolation, timing, timeout, and deletion checks passed |
 | Workload | `logs-parse-v1`: strict parsing and aggregation with a trusted oracle |
-| Acceptance | Correct outputs, 30 timing pairs, at least 3x median speedup and a 95% bootstrap CI lower bound of at least 3x |
+| Acceptance | Correct outputs, 30 timing pairs, and a median speedup and 95% bootstrap CI lower bound both strictly above 1.0x ("provably faster"). Runs before October 17 ~16:55 PDT, including all recorded results below, used a 3x bar and were judged under it |
 | Evidence | Raw execution proofs, artifact hashes, receipts, audit, and a hash-chain ledger |
 | Local tests | 411 Python tests and 117 UI bridge tests passing (repo input, analyst, fault drill, replay and launch API) |
 | B: agent orchestration | Event-built `agent_team/` state machine, retries/fallback, budgets, official ledger, and live `run` CLI |
@@ -45,6 +45,8 @@ The known-reference and zoo numbers are preparation evidence. Both live developm
 4. Require candidate-bound verifier evidence before full acceptance.
 5. Materialize outputs inside the measured interval, compare against the oracle, and evaluate all 30 timing pairs.
 6. Confirm sandbox deletion, seal the evidence, and audit the receipt before returning acceptance.
+
+**Acceptance bar.** From October 17 ~16:55 PDT the acceptance bar is "provably faster" (median and 95% CI lower bound strictly above 1.0x). Every run before that, including all recorded results below, used the 3x bar and was judged under it; those receipts still audit under their recorded 3.0 policy.
 
 Candidate code never executes on the controller. Synthetic demonstrations always return `accepted=false`. The detailed security model and its limits are in [PREP.md](PREP.md#3-daytona-isolation-and-timing).
 
@@ -162,7 +164,7 @@ How it is handled:
 - Repo code (the target and the generator) never runs on the laptop. It is bundled (zlib + base64) with a small in-memory importer and runs only inside the Daytona sandbox, under the same supervisor and limits as candidates. The frozen sandbox runner is unchanged.
 - `prepare-repo` runs the generator in the sandbox to create 2,000 hidden correctness inputs and 40 timing workloads (5 warmup, 5 screen, 30 acceptance). It runs the original function in the sandbox to record the expected outputs.
 - Everything is sealed under `private/sessions/<S>.repo/` (mode 0600), with digests in the session file. The GitHub commit SHA and the bundle digest are recorded.
-- The original function is both the baseline and the oracle. Acceptance is unchanged: 30 pairs, median at least 3x and a 95% CI lower bound of at least 3x.
+- The original function is both the baseline and the oracle. Acceptance is unchanged: 30 pairs, median and 95% CI lower bound both above 1.0x (the earlier 3x bar applied to runs before October 17 ~16:55 PDT).
 - Runs on user repos are labeled "development live run on user repo; not an official session" in the ledger.
 
 Limits:

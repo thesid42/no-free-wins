@@ -247,13 +247,15 @@ def check_live(session_id, *, deadline_seconds=None, max_rounds=None, max_cost_u
 
 def build_live_run(*, session_id, output_dir, deadline_seconds=None, max_rounds=None, max_cost_usd=None,
                    max_tokens=None, client=None, evaluate=None, available_ids=None,
-                   inject_failures=False, extra_summary=None, parallel=None):
+                   inject_failures=False, extra_summary=None, parallel=None, screen_bar=None):
     """Return (Orchestrator, info). The output directory is created only after every check passes.
     Unset settings come from the global config. extra_summary (public text, e.g. lessons from an
     earlier attempt) is appended to the task summary the planner and workers see. parallel=None
     takes run.parallel from the config (workers, screens and verifiers overlap within a round)."""
     if parallel is None:
         parallel = nfw_config.load_config()["run"]["parallel"]
+    if screen_bar is None:
+        screen_bar = nfw_config.load_config()["run"]["screen_bar"]
     deadline_seconds, max_rounds, max_cost_usd, max_tokens = _run_defaults(
         deadline_seconds, max_rounds, max_cost_usd, max_tokens)
     check_session_id(session_id)
@@ -285,7 +287,7 @@ def build_live_run(*, session_id, output_dir, deadline_seconds=None, max_rounds=
         evaluate=evaluate or real_evaluate, client=client, budget=budget, ledger_path=ledger,
         session_id=session_id, orders=orders, deadline_seconds=deadline_seconds,
         max_rounds=max_rounds, max_tokens=max_tokens, annotations=annotations,
-        task_id=task_id, task_summary=task_summary, parallel=parallel,
+        task_id=task_id, task_summary=task_summary, parallel=parallel, screen_bar=screen_bar,
         preflight=make_preflight(session_id),
         min_harness_seconds=dict(LIVE_HARNESS_FLOORS))  # only ever raised above the defaults
     Path(output_dir).mkdir(parents=True, exist_ok=True)

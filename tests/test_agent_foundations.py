@@ -127,10 +127,21 @@ class ContractTests(unittest.TestCase):
         self.assertFalse(is_verified_done(measured(status="simulated_acceptance", origin="synthetic")))
         self.assertFalse(is_verified_done(measured(receipt_sha256=None)))
         self.assertFalse(is_verified_done(measured(receipt_sha256="A" * 64)))
-        for field, value in (("pairs", 29), ("ci_lower", 2.9), ("median_speedup", 2.9)):
+        for field, value in (("pairs", 29), ("ci_lower", 1.0), ("median_speedup", 1.0),
+                             ("ci_lower", 0.98), ("median_speedup", 0.9)):
             resp = measured()
             resp["acceptance"][field] = value
             self.assertFalse(is_verified_done(resp))
+        for median_speedup, ci_lower in ((1.2, 1.1), (3.4, 1.01)):
+            resp = measured()
+            resp["acceptance"].update(median_speedup=median_speedup, ci_lower=ci_lower)
+            self.assertTrue(is_verified_done(resp))
+        # a recorded legacy policy keeps its own 3.0 bar; unknown or absent policies mean 1.0
+        for policy_min, expected in ((3.0, False), (1.0, True), (2.0, True), (None, True)):
+            resp = measured()
+            resp["acceptance"].update(median_speedup=2.5, ci_lower=2.4,
+                                      policy={"minimum_speedup": policy_min})
+            self.assertIs(is_verified_done(resp), expected)
         for field, value in (("origin", "synthetic"), ("reasons", ["synthetic_evidence"])):
             resp = measured()
             resp["acceptance"][field] = value

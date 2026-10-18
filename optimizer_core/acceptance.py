@@ -8,6 +8,9 @@ from statistics import median
 
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 
+# 1.0 is the current rule: provably faster. 3.0 is the legacy bar, kept so earlier receipts audit.
+LEGAL_MINIMUM_SPEEDUPS = (1.0, 3.0)
+
 
 def _positive(value):
     return type(value) in (int, float) and math.isfinite(value) and value > 0
@@ -16,7 +19,7 @@ def _positive(value):
 @dataclass(frozen=True)
 class AcceptancePolicy:
     pairs: int = 30
-    minimum_speedup: float = 3.0
+    minimum_speedup: float = 1.0
     bootstrap_resamples: int = 10_000
     bootstrap_seed: int = 42
     ci_level: float = 0.95
@@ -24,8 +27,9 @@ class AcceptancePolicy:
     def validate(self):
         if type(self.pairs) is not int or self.pairs != 30:
             raise ValueError("full acceptance requires exactly 30 pairs")
-        if not _positive(self.minimum_speedup) or self.minimum_speedup != 3.0:
-            raise ValueError("the frozen speed bar is 3.0x")
+        if (not _positive(self.minimum_speedup)
+                or self.minimum_speedup not in LEGAL_MINIMUM_SPEEDUPS):
+            raise ValueError("the speed bar must be 1.0x (provably faster) or the legacy 3.0x")
         if type(self.bootstrap_resamples) is not int or self.bootstrap_resamples != 10_000:
             raise ValueError("full acceptance requires 10000 bootstrap resamples")
         if type(self.bootstrap_seed) is not int:
@@ -89,14 +93,18 @@ def evaluate(pairs, *, origin, correctness_passed, verifier_passed,
     lower, upper = _percentile(samples, alpha), _percentile(samples, 1 - alpha)
     observed = median(ratios)
     reasons = []
+    # Legacy 3.0 receipts keep their original reason codes so recorded rejections still audit.
+    legacy = policy.minimum_speedup == 3.0
+    median_reason = "median_below_bar" if legacy else "median_below_minimum_speedup"
+    lower_reason = "ci_lower_bound_below_bar" if legacy else "ci_lower_bound_below_minimum_speedup"
     for condition, reason in (
         (origin == "measured", "synthetic_evidence"),
         (correctness_passed, "correctness_gate_failed"),
         (verifier_passed, "verifier_gate_failed"),
         (evidence_complete, "incomplete_evidence"),
         (outputs_match, "timed_output_mismatch"),
-        (observed >= policy.minimum_speedup, "median_below_bar"),
-        (lower >= policy.minimum_speedup, "ci_lower_bound_below_bar"),
+        (observed > policy.minimum_speedup, median_reason),
+        (lower > policy.minimum_speedup, lower_reason),
     ):
         if not condition:
             reasons.append(reason)

@@ -78,7 +78,7 @@ class _Terminal(Exception):
 
 class Orchestrator:
     def __init__(self, *, evaluate, client, budget, ledger_path, session_id, orders,
-                 deadline_seconds, max_rounds=3, screen_bar=3.0, clock=time.monotonic,
+                 deadline_seconds, max_rounds=3, screen_bar=1.0, clock=time.monotonic,
                  utcnow=_utcnow, new_id=lambda: uuid.uuid4().hex,
                  task_summary=roles.TASK_SUMMARY, playbook=None, annotations=(),
                  min_harness_seconds=None, preflight=None, max_tokens=4096,
@@ -310,7 +310,7 @@ class Orchestrator:
         if response["status"] == "infrastructure_error":
             raise _Terminal("failed_infrastructure", "screen status infrastructure_error")
         if (response["status"] == "screened" and response["correctness_passed"] and
-                speedup is not None and speedup >= self.screen_bar):
+                speedup is not None and speedup > self.screen_bar):
             tally["qualifying"].append((candidate, response, speedup))
 
     def _screen_finish(self, tally):

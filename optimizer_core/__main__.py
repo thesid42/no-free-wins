@@ -152,9 +152,20 @@ def main():
             fields = dict(proposal=proposal, origin_info=origin_info)
         else:
             root, fields = args.repo, {}
-        with verified_backend() as backend:
-            result = prepare_repo_session(args.session_id, str(root), backend=backend,
-                                          include=args.include, **fields)
+        # A SIGTERM (e.g. a caller's timeout) must unwind through verified_backend's cleanup
+        # instead of killing the process with the sandbox still running.
+        import signal
+        try:
+            previous = signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+        except ValueError:  # not the main thread
+            previous = None
+        try:
+            with verified_backend() as backend:
+                result = prepare_repo_session(args.session_id, str(root), backend=backend,
+                                              include=args.include, **fields)
+        finally:
+            if previous is not None:
+                signal.signal(signal.SIGTERM, previous)
         directory = Path("artifacts/commitments")
         directory.mkdir(parents=True, exist_ok=True)
         (directory / (args.session_id + ".json")).write_bytes(canonical_json(result))

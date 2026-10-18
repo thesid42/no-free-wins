@@ -89,7 +89,7 @@ SMALL_FLOORS = {"screen": 1, "acceptance": 1}
 def measured_metrics(**overrides):
     metrics = {"accepted": True, "origin": "measured", "pairs": 30, "median_speedup": 3.5,
                "ci_lower": 3.4, "ci_upper": 3.6, "reasons": [],
-               "policy": {"pairs": 30, "minimum_speedup": 3.0, "bootstrap_resamples": 10_000,
+               "policy": {"pairs": 30, "minimum_speedup": 1.0, "bootstrap_resamples": 10_000,
                           "bootstrap_seed": 42, "ci_level": 0.95}}
     metrics.update(overrides)
     return metrics
@@ -528,7 +528,7 @@ class EvidenceTests(OrchestrationCase):
             "a-primary": [fence(SOURCE_A), fence(a2)], "b-primary": [fence(SOURCE_B), fence(b2)],
             "v-primary": [verdict(make_candidate("x", a2)["sha256"])]})
         harness = FakeHarness(harness_script(**self.exhausted_screen_a()))
-        result = self.orchestrate(client_script, harness=harness)
+        result = self.orchestrate(client_script, harness=harness, screen_bar=3.0)
         self.assertEqual(result.state, "simulation_completed")
         self.assertEqual(result.rounds, 2)
         first, second = self.modes("screen")[:2]  # the other candidate was still screened
@@ -676,7 +676,7 @@ class MultiRoundTests(OrchestrationCase):
         harness = FakeHarness({f"{w}-r{n}": slow for w in ("worker_a", "worker_b")
                                for n in (1, 2, 3)})
         secret = "SECRET-SESSION-xyz"
-        result = self.orchestrate(client_script, harness=harness, max_rounds=3, session_id=secret)
+        result = self.orchestrate(client_script, harness=harness, max_rounds=3, session_id=secret, screen_bar=3.0)
         for _, _, messages in self.client.calls:
             self.assertNotIn(secret, json.dumps(messages))
         self.assertEqual(result.state, "rounds_exhausted")

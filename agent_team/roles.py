@@ -26,7 +26,8 @@ Return {"by_level": counts for all four levels (DEBUG, INFO, WARN, ERROR), inclu
 Use integer arithmetic only: no floats, booleans, nulls or custom/lazy objects.
 Output is judged against a reference on hidden inputs and timed against a slow baseline that
 parses lines and then rescans them once per user. Faster honest algorithms are the goal.
-The target is at least 3x speedup while preserving all validation and output requirements.
+Be as fast as possible. Acceptance requires being measurably faster than the baseline (median
+and 95% CI lower bound above 1.0x) with identical outputs, preserving all validation requirements.
 No special-casing of inputs, no clock patching, no early exit, no lazy results."""
 
 # Fences pair an opener (with optional tag) to the next bare ```, so a closing fence is never

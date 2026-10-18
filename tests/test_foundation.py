@@ -86,12 +86,48 @@ class AcceptanceTests(unittest.TestCase):
                 self.evaluate(trials)
 
     def test_median_can_pass_while_lower_bound_fails(self):
-        trials = [replace(item, baseline_seconds=2.0 if i < 14 else 4.0,
+        # 14 pairs slower than baseline, 16 faster: the median is above 1.0 but the CI reaches below it
+        trials = [replace(item, baseline_seconds=0.5 if i < 14 else 1.5,
                           candidate_seconds=1.0) for i, item in enumerate(pairs())]
         result = self.evaluate(trials)
-        self.assertGreaterEqual(result["median_speedup"], 3)
+        self.assertGreater(result["median_speedup"], 1.0)
+        self.assertLessEqual(result["ci_lower"], 1.0)
         self.assertFalse(result["accepted"])
-        self.assertIn("ci_lower_bound_below_bar", result["reasons"])
+        self.assertIn("ci_lower_bound_below_minimum_speedup", result["reasons"])
+
+    def ratios(self, values):
+        return [replace(item, baseline_seconds=value, candidate_seconds=1.0)
+                for item, value in zip(pairs(), values)]
+
+    def test_modest_but_provable_speedup_is_accepted(self):
+        result = self.evaluate(self.ratios([1.1 + 0.2 * (i % 3) / 2 for i in range(30)]))
+        self.assertGreater(result["ci_lower"], 1.0)
+        self.assertTrue(result["accepted"])
+        self.assertEqual(result["reasons"], [])
+        self.assertEqual(result["policy"]["minimum_speedup"], 1.0)
+
+    def test_median_above_one_with_ci_lower_below_one_is_rejected(self):
+        values = [0.95] * 13 + [1.5] * 17
+        result = self.evaluate(self.ratios(values))
+        self.assertGreater(result["median_speedup"], 1.0)
+        self.assertLess(result["ci_lower"], 1.0)
+        self.assertEqual(result["reasons"], ["ci_lower_bound_below_minimum_speedup"])
+
+    def test_exactly_one_is_rejected_strictly(self):
+        result = self.evaluate(self.ratios([1.0] * 30))
+        self.assertEqual((result["median_speedup"], result["ci_lower"]), (1.0, 1.0))
+        self.assertFalse(result["accepted"])
+        self.assertEqual(result["reasons"], ["median_below_minimum_speedup",
+                                             "ci_lower_bound_below_minimum_speedup"])
+
+    def test_legacy_three_x_policy_is_still_valid_and_strict(self):
+        legacy = replace(POLICY, minimum_speedup=3.0)
+        legacy.validate()
+        result = evaluate(self.ratios([2.0] * 30), origin="measured", policy=legacy, **GATES)
+        self.assertFalse(result["accepted"])
+        self.assertEqual(result["reasons"], ["median_below_bar", "ci_lower_bound_below_bar"])
+        self.assertTrue(evaluate(self.ratios([4.0] * 30), origin="measured", policy=legacy,
+                                 **GATES)["accepted"])
 
     def test_bootstrap_is_reproducible(self):
         trials = [replace(item, baseline_seconds=2.5 + i / 10,
@@ -100,7 +136,8 @@ class AcceptanceTests(unittest.TestCase):
 
     def test_frozen_policy_cannot_be_weakened(self):
         for policy in (replace(POLICY, pairs=5),
-                       replace(POLICY, minimum_speedup=1.0),
+                       replace(POLICY, minimum_speedup=2.0),
+                       replace(POLICY, minimum_speedup=0.9),
                        replace(POLICY, bootstrap_resamples=100),
                        replace(POLICY, ci_level=0.50)):
             with self.subTest(policy=policy), self.assertRaises(ValueError):
@@ -122,11 +159,11 @@ class ArtifactTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 verify_ledger(path)
 
-    def make_receipt(self, directory, *, origin="measured"):
+    def make_receipt(self, directory, *, origin="measured", policy=POLICY):
         artifact = directory / "artifact.json"
         artifact.write_bytes(b'{"fixture":true}')
         receipt = create_receipt(
-            pairs(), origin=origin, policy=POLICY, gates=GATES,
+            pairs(), origin=origin, policy=policy, gates=GATES,
             artifacts=[{"path": artifact.name, "sha256": digest(artifact.read_bytes())}])
         path = directory / "receipt.json"
         path.write_bytes(canonical_json(receipt))
@@ -144,6 +181,13 @@ class ArtifactTests(unittest.TestCase):
             (path.parent / "artifact.json").write_bytes(b"altered")
             with self.assertRaises(ValueError):
                 audit_receipt(path, expected_sha256=anchor)
+
+    def test_legacy_three_x_receipt_still_audits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.make_receipt(Path(directory), policy=replace(POLICY, minimum_speedup=3.0))
+            result = audit_receipt(path, expected_sha256=digest(path.read_bytes()))
+            self.assertTrue(result["accepted"])
+            self.assertEqual(result["policy"]["minimum_speedup"], 3.0)
 
     def test_audit_rejects_artifact_path_escape(self):
         with tempfile.TemporaryDirectory() as directory:

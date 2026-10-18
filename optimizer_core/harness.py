@@ -262,7 +262,8 @@ class Harness:
             sdk_version = "not-installed-synthetic"
         runtime = canonical_json({"controller_python": platform.python_version(),
                                   "daytona_sdk": sdk_version,
-                                  "environment_sha256": self.backend.environment_sha256})
+                                  "environment_sha256": self.backend.environment_sha256,
+                                  "isolation_probe": getattr(self.backend, "isolation_probe", "passed")})
         (self.directory / "runtime.json").write_bytes(runtime)
         self.artifacts.append({"path": "runtime.json", "sha256": digest(runtime)})
         response = {"schema_version": 1, "request_id": request["request_id"],

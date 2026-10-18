@@ -86,7 +86,7 @@ def validate_config(config):
         raise ConfigError(f"unknown top-level keys: {', '.join(sorted(extra))}")
     models = _section(config, "models", ROLES)
     run = _section(config, "run", ("deadline_seconds", "max_rounds", "max_cost_usd",
-                                   "max_tokens_per_call"), optional=("parallel",))
+                                   "max_tokens_per_call"), optional=("parallel", "screen_bar"))
     analysis = _section(config, "analysis", ("max_cost_usd", "max_question_rounds",
                                              "max_tokens_per_call"))
     repo = _section(config, "repo", ("include", "timing_size", "correctness_sizes"))
@@ -108,7 +108,9 @@ def validate_config(config):
             "max_tokens_per_call": _integer(run["max_tokens_per_call"], "run.max_tokens_per_call",
                                             MIN_CALL_TOKENS, MAX_CALL_TOKENS),
             # Optional so older config files keep working; absent means the sequential path.
-            "parallel": _boolean(run.get("parallel", False), "run.parallel")},
+            "parallel": _boolean(run.get("parallel", False), "run.parallel"),
+            # Screening threshold only; acceptance always uses the audited policy bar.
+            "screen_bar": _number(run.get("screen_bar", 1.0), "run.screen_bar", upper=100)},
         "analysis": {
             "max_cost_usd": _number(analysis["max_cost_usd"], "analysis.max_cost_usd",
                                     upper=MAX_OFFICIAL_COST_USD),

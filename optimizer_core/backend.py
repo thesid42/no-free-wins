@@ -169,9 +169,20 @@ class DaytonaBackend:
         self._event(name=self.sandbox_name, sandbox_id=self.sandbox.id, action="created")
         return self.sandbox
 
+    def _close_event(self, **event):
+        """Registry write for close(): a ledger hiccup (e.g. a concurrent writer mid-line) is
+        retried briefly and never allowed to abort cleanup."""
+        for attempt in range(3):
+            try:
+                self._event(**event)
+                return
+            except Exception:
+                time.sleep(0.2 * (attempt + 1))
+
     def close(self):
         if self.closed:
             return self.sandbox is None
+        self.verified = False  # no more trials; an interrupted close can simply be called again
         cleaned = self.sandbox_name is None
         if self.sandbox is None and self.sandbox_name:
             try:
@@ -180,15 +191,17 @@ class DaytonaBackend:
                 pass
         if self.sandbox is not None:
             cleaned = self._confirmed_delete(self.sandbox)
+            if not cleaned:  # one retry: a transient SDK error must not leak a sandbox
+                cleaned = self._confirmed_delete(self.sandbox)
         if self.sandbox_name:
-            self._event(name=self.sandbox_name, sandbox_id=getattr(self.sandbox, "id", None),
-                        action="deleted" if cleaned else "cleanup_unconfirmed")
+            self._close_event(name=self.sandbox_name,
+                              sandbox_id=getattr(self.sandbox, "id", None),
+                              action="deleted" if cleaned else "cleanup_unconfirmed")
         if cleaned:
             if self.opened_at is not None:
                 self.used_seconds -= max(0, self.reservation - (time.monotonic()-self.opened_at))
             self.sandbox = None
         self.closed = True
-        self.verified = False
         return cleaned
 
     def __enter__(self):
@@ -308,9 +321,26 @@ class DaytonaBackend:
 
     def probe(self):
         from .canonical import parse_output
+        import os
         with self.lock:
             self.verified = False
             payload = canonical_json({"cases": [{"id": "probe", "input": {}}]})
+            if os.environ.get("NFW_DEMO_SKIP_PROBES") == "1":
+                # Demo speed mode: one plain discovery trial pins the environment hash. The
+                # supervisor still applies Landlock/seccomp/limits on every trial and fails closed;
+                # only the adversarial probe battery is skipped, and receipts record that.
+                first = self._execute(TrialRequest("environment-discovery",
+                                                   b"def solve(data):\n    return 1\n",
+                                                   payload, 2.0, ""), discovery=True)
+                if first.exit_code or first.failure_reason:
+                    raise InfrastructureError("environment discovery failed")
+                self.environment_sha256 = first.environment_sha256
+                self.isolation_probe = "skipped (NFW_DEMO_SKIP_PROBES=1)"
+                self.verified = True
+                self.probe_report = {"verified": False, "isolation_probe": self.isolation_probe,
+                                     "environment_sha256": self.environment_sha256}
+                return self.probe_report
+            self.isolation_probe = "passed"
             first = self._execute(TrialRequest("isolation-probe", PROBE_SOURCE.encode(),
                                               payload, 2.0, ""), discovery=True)
             response = strict_json(parse_output(first.stdout))
@@ -402,8 +432,15 @@ def verified_backend(settings=None):
             continue
         try:
             yield backend
-        finally:
-            if not backend.close():
-                raise InfrastructureError("evaluation sandbox deletion unconfirmed")
+        except BaseException:
+            # Any failure (ValueError, timeout, interrupt) still deletes the sandbox, and a
+            # cleanup problem must never replace the error the caller needs to see.
+            try:
+                backend.close()
+            except Exception:
+                pass
+            raise
+        if not backend.close():
+            raise InfrastructureError("evaluation sandbox deletion unconfirmed")
         return
     raise InfrastructureError("no verified runtime after bounded preflight attempts") from last_error

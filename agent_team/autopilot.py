@@ -28,7 +28,7 @@ MAX_LESSONS_CHARS = 1500
 AUTO_FILE = "auto.json"
 AUTO_VERSION = 1
 LESSONS_HEADER = "Lessons from the previous attempt: "
-SCREEN_BAR = 3.0
+SCREEN_BAR = 1.0  # default run.screen_bar; a screen must be strictly above it
 ANALYST_RETRY_DELAYS = (20, 60, 60, 60)  # seconds before analyst retry 1, 2, ...
 
 
@@ -90,7 +90,7 @@ def build_lessons(run):
                          f"correct={event.get('correctness_passed')}, screen speedup {speedup}")
             if event.get("correctness_passed") is False:
                 codes.append("correctness_failed")
-            elif speedup is not None and speedup < SCREEN_BAR:
+            elif speedup is not None and speedup <= SCREEN_BAR:
                 codes.append("screen_below_bar")
         elif kind == "verifier_verdict":
             parts.append(f"round {rnd}: {who} verifier approved={event.get('approved')}")

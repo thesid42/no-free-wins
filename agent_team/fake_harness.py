@@ -88,7 +88,7 @@ class FakeHarness:
                         acceptance={"accepted": False, "origin": "synthetic", "pairs": 30,
                                     "median_speedup": 4.0, "ci_lower": 3.5, "ci_upper": 4.5,
                                     "reasons": ["synthetic_evidence"],
-                                    "policy": {"pairs": 30, "minimum_speedup": 3.0,
+                                    "policy": {"pairs": 30, "minimum_speedup": 1.0,
                                                "bootstrap_resamples": 10000,
                                                "bootstrap_seed": 42, "ci_level": 0.95}})
         for key, value in copy.deepcopy(overrides).items():

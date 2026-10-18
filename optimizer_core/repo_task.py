@@ -929,8 +929,9 @@ class RepoTask:
                  "Repo modules are importable from your solution, for example "
                  f"`from {spec['target_module']} import {function}`. Importable modules: "
                  + ", ".join(modules[:60]) + (" ..." if len(modules) > 60 else ""),
-                 "Target: at least 3x faster than the baseline on median across hidden timing "
-                 f"workloads (timing inputs have size {spec['timing_size']}).",
+                 "Target: as fast as possible. Acceptance requires being measurably faster than the "
+                 "baseline (median and 95% CI lower bound of the speedup above 1.0x) across hidden "
+                 f"timing workloads (timing inputs have size {spec['timing_size']}).",
                  "Public examples (input -> expected output):"]
         for example in self._public:
             parts.append(_clip_text(canonical_json(example["input"]).decode("utf-8")) + " -> "

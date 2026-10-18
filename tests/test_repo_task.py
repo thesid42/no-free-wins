@@ -5,17 +5,21 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
 import time
+import types
 import unittest
 from unittest import mock
 
 import optimizer_core
 from optimizer_core import repo_task
-from optimizer_core.backend import TrialResult
+from optimizer_core.backend import DaytonaBackend, InfrastructureError, TrialResult
+from optimizer_core.config import DaytonaSettings
+from optimizer_core.ledger import verify_ledger
 from optimizer_core.canonical import canonical_json, digest, strict_json
 from optimizer_core.harness import CandidateFailure, Harness
 from optimizer_core.repo_task import (
@@ -578,7 +582,7 @@ class PreparedSessionTests(unittest.TestCase):
     def test_public_summary_and_artifacts(self):
         summary = self.task.public_summary()
         for needle in ("top_words(data)", "def top_words", "must return exactly what top_words",
-                       "3x", "Standard library only", "textstats.core", "special-casing",
+                       "measurably faster", "Standard library only", "textstats.core", "special-casing",
                        "clock patching", "early exit", "lazy results", "->",
                        "No floats, booleans"):
             self.assertIn(needle, summary)
@@ -1339,6 +1343,196 @@ class CliProposalTests(unittest.TestCase):
         self.assertEqual(kwargs["proposal"]["target"], "textstats/core.py:top_words")
         self.assertIsNone(kwargs["include"])
         self.assertTrue((self.base / "artifacts" / "commitments" / "s1.json").is_file())
+
+
+class _SandboxClient:
+    """Minimal Daytona SDK fake: remembers whether the one sandbox was deleted."""
+
+    def __init__(self):
+        self.created = self.deleted = False
+
+    def create(self, params, timeout=60):
+        self.created = True
+        self.sandbox = types.SimpleNamespace(id="fake-sandbox")
+        return self.sandbox
+
+    def delete(self, sandbox, timeout=60, wait=False):
+        self.deleted = True
+
+    def get(self, name, request_timeout=10):
+        if self.deleted or not self.created:
+            raise type("DaytonaNotFoundError", (Exception,), {})()
+        return self.sandbox
+
+
+class _ClosableBackend(DaytonaBackend):
+    """The real DaytonaBackend lifecycle (registry, close, delete) over a scripted trial runner."""
+    origin = "synthetic"
+
+    def __init__(self, inner, client, registry):
+        super().__init__(DaytonaSettings(api_key="unit"), client=client, registry=registry)
+        self.inner, self.environment_sha256 = inner, inner.environment_sha256
+
+    def probe(self):
+        self._open()
+        self.verified = True
+
+    def run_trial(self, request):
+        return self.inner.run_trial(request)
+
+
+class PrepareFailureCleanupTests(unittest.TestCase):
+    """Every prepare-repo failure must delete its sandbox and keep the user-facing error."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.base = Path(self.directory.name)
+
+    def run_prepare(self, inner, files=BASIC, **spec):
+        import dataclasses
+        spec.setdefault("correctness_sizes", [0, 1, 2])
+        repo = write_repo(self.base / "repo", files, **spec)
+        client, registry = _SandboxClient(), self.base / "registry.jsonl"
+        made = []
+
+        def factory(settings):
+            made.append(_ClosableBackend(inner, client, registry))
+            return made[0]
+
+        argv = ["optimizer_core", "prepare-repo", "--session-id", "s1", "--repo", str(repo)]
+        cwd = os.getcwd()
+        os.chdir(self.base)
+        try:
+            with mock.patch.object(sys, "argv", argv), \
+                    mock.patch("optimizer_core.backend.DaytonaBackend", side_effect=factory), \
+                    mock.patch("optimizer_core.config.DaytonaSettings.load",
+                               return_value=DaytonaSettings(api_key="unit")), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                try:
+                    cli.main()
+                except BaseException as exc:
+                    error = exc
+                    self.traceback = __import__("traceback").format_exc()
+                else:
+                    error = None
+        finally:
+            os.chdir(cwd)
+        self.assertEqual(len(made), 1)
+        return error, made[0], client, [record["event"]["action"]
+                                        for record in verify_ledger(registry)]
+
+    def assert_cleaned(self, backend, client, actions):
+        self.assertTrue(client.created)
+        self.assertTrue(client.deleted)
+        self.assertTrue(backend.closed)
+        self.assertIsNone(backend.sandbox)
+        self.assertEqual(actions, ["creating", "created", "deleted"])
+
+    def test_generator_output_limit_deletes_the_sandbox_and_keeps_the_message(self):
+        error, backend, client, actions = self.run_prepare(CapBackend(cap=20))
+        self.assertIsInstance(error, ValueError)
+        self.assertRegex(str(error), r"generator hit its output_limit limit on a single case "
+                                     r"\(.*\); lower timing_size")
+        self.assert_cleaned(backend, client, actions)
+
+    def test_trial_timeout_deletes_the_sandbox(self):
+        class Timeout(CapBackend):
+            def run_trial(self, request):
+                result = super().run_trial(request)
+                import dataclasses
+                return dataclasses.replace(result, exit_code=-9, failure_reason="process_timeout")
+
+        error, backend, client, actions = self.run_prepare(Timeout(cap=1 << 20))
+        self.assertIsInstance(error, ValueError)
+        self.assertIn("process_timeout limit on a single case", str(error))
+        self.assert_cleaned(backend, client, actions)
+
+    def test_nondeterministic_target_deletes_the_sandbox(self):
+        files = dict(BASIC, **{"pkg/core.py": ("import random\n\ndef f(data):\n"
+                                               "    return [random.randrange(10**9)]\n")})
+        error, backend, client, actions = self.run_prepare(LocalSubprocessBackend(), files)
+        self.assertRegex(str(error), "not deterministic")
+        self.assert_cleaned(backend, client, actions)
+
+    def test_slow_baseline_deletes_the_sandbox(self):
+        import dataclasses
+
+        class Slow(LocalSubprocessBackend):
+            def run_trial(self, request):
+                return dataclasses.replace(super().run_trial(request),
+                                           trusted_process_seconds=1.5)
+
+        error, backend, client, actions = self.run_prepare(Slow())
+        self.assertRegex(str(error), "lower timing_size")
+        self.assert_cleaned(backend, client, actions)
+
+    def test_infrastructure_error_deletes_the_sandbox(self):
+        class Broken(LocalSubprocessBackend):
+            def run_trial(self, request):
+                raise InfrastructureError("remote operation deadline exhausted")
+
+        error, backend, client, actions = self.run_prepare(Broken())
+        self.assertIsInstance(error, InfrastructureError)
+        self.assertEqual(str(error), "remote operation deadline exhausted")
+        self.assert_cleaned(backend, client, actions)
+
+    def test_sigterm_during_prepare_still_deletes_the_sandbox(self):
+        class Terminated(LocalSubprocessBackend):
+            def run_trial(self, request):
+                os.kill(os.getpid(), signal.SIGTERM)
+                time.sleep(5)
+
+        error, backend, client, actions = self.run_prepare(Terminated())
+        self.assertIsInstance(error, SystemExit)
+        self.assert_cleaned(backend, client, actions)
+        self.assertEqual(signal.getsignal(signal.SIGTERM), signal.SIG_DFL)
+
+    def test_unconfirmed_deletion_never_masks_the_prepare_error(self):
+        class Stuck(_SandboxClient):
+            def delete(self, sandbox, timeout=60, wait=False):
+                raise TimeoutError("injected")
+
+            def get(self, name, request_timeout=10):
+                return self.sandbox
+
+        client = Stuck()
+        backend = _ClosableBackend(CapBackend(cap=1 << 20), client, self.base / "r.jsonl")
+        with self.assertRaisesRegex(ValueError, "boom"):
+            with verified_backend_for(backend):
+                raise ValueError("boom")
+        self.assertEqual([record["event"]["action"] for record in
+                          verify_ledger(self.base / "r.jsonl")],
+                         ["creating", "created", "cleanup_unconfirmed"])
+
+
+    def test_registry_write_failure_does_not_abort_close(self):
+        client = _SandboxClient()
+        backend = _ClosableBackend(CapBackend(cap=1 << 20), client, self.base / "r.jsonl")
+        backend.probe()
+        real, attempts = backend._event, []
+
+        def flaky(**event):  # e.g. a concurrent process is mid-line in the shared ledger
+            attempts.append(event["action"])
+            if len(attempts) < 3:
+                raise ValueError("oversized or incomplete ledger line")
+            return real(**event)
+
+        backend._event = flaky
+        with mock.patch("optimizer_core.backend.time.sleep"):
+            self.assertTrue(backend.close())
+        self.assertTrue(client.deleted and backend.closed)
+        self.assertEqual(attempts, ["deleted"] * 3)
+        self.assertEqual(verify_ledger(self.base / "r.jsonl")[-1]["event"]["action"], "deleted")
+
+
+@contextlib.contextmanager
+def verified_backend_for(backend):
+    """verified_backend() over a prebuilt backend (its preflight allocation is the one sandbox)."""
+    from optimizer_core.backend import verified_backend
+    with mock.patch("optimizer_core.backend.DaytonaBackend", return_value=backend):
+        with verified_backend(DaytonaSettings(api_key="unit")) as yielded:
+            yield yielded
 
 
 class LogsPathUnchangedTests(unittest.TestCase):

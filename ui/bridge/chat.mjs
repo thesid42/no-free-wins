@@ -51,7 +51,7 @@ const answers = {
       .map((s) => `${s.candidate_id} ${fx(s.screen_median_speedup, 2)}`);
     if (r) {
       return `The audited result is a median speedup of ${fx(r.medianSpeedup)} over ${r.timingPairs} matched timing pairs for ${r.candidateId}, `
-        + `${f.minimumSpeedup === null ? '' : `against the ${fx(f.minimumSpeedup, 1)} bar. `}Screening estimates (${list(screens)}) were used for ranking only and are not the result.`;
+        + `${f.minimumSpeedup === null ? '' : `which clears the acceptance rule (median and 95% CI lower bound above ${fx(f.minimumSpeedup, 1)}). `}Screening estimates (${list(screens)}) were used for ranking only and are not the result.`;
     }
     return `This run (${f.result.state}) has no passing full acceptance, so there is no verified speedup to report. `
       + `Screening estimates, which only rank candidates: ${list(screens)}.`;
@@ -60,7 +60,7 @@ const answers = {
     const r = acceptance(f);
     if (!r) return `No passing full acceptance was recorded for this run (${f.result.state}), so there is no confidence interval.`;
     return `The 95% bootstrap confidence interval for the median speedup is ${r.confidenceInterval95[0].toFixed(3)}–${r.confidenceInterval95[1].toFixed(3)}× `
-      + `over ${r.timingPairs} paired timings (10,000 resamples, fixed seed). ${f.minimumSpeedup !== null && r.confidenceInterval95[0] >= f.minimumSpeedup ? `The whole interval is above the ${fx(f.minimumSpeedup, 1)} bar.` : ''}`;
+      + `over ${r.timingPairs} paired timings (10,000 resamples, fixed seed). ${f.minimumSpeedup !== null && r.confidenceInterval95[0] > f.minimumSpeedup ? `The whole interval is above ${fx(f.minimumSpeedup, 1)}, so the result is provably faster.` : ''}`;
   },
   verifier(f) {
     if (!f.verdicts.length) return 'No verifier verdict was recorded for this run. Only a hash-bound verifier approval allows a candidate to reach full acceptance.';
@@ -114,7 +114,7 @@ const answers = {
     clauses.push(!f.acceptances.length ? 'full acceptance: not reached'
       : `full acceptance ran ${f.acceptances.length} time${f.acceptances.length === 1 ? '' : 's'}`
         + `${pairs ? ` with ${pairs} timing pairs` : ''}${r.accepted ? ' and passed' : ' and was not accepted'}`
-        + `${decision && f.minimumSpeedup !== null ? ` against a ${fx(f.minimumSpeedup, 1)} bar` : ''}`);
+        + `${decision && f.minimumSpeedup !== null ? ` (rule: median and CI lower bound above ${fx(f.minimumSpeedup, 1)})` : ''}`);
     clauses.push(f.audit === null ? 'no receipt exists to audit'
       : f.audit.valid ? 'the stored receipt re-audited as valid offline' : 'the receipt audit FAILED');
     if (r.sandboxDeleted) clauses.push('the evaluation sandbox was confirmed deleted');

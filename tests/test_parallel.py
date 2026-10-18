@@ -271,7 +271,8 @@ class VerifierSelectionTests(ParallelCase):
 
     def test_unscreened_or_below_bar_candidates_are_never_chosen(self):
         # B is approved but below the bar: only A qualifies, and A is rejected.
-        result = self.orchestrate(RoleClient(verdicts={SHA_A: False}), max_rounds=1)
+        result = self.orchestrate(RoleClient(verdicts={SHA_A: False}), max_rounds=1,
+                                  screen_bar=3.0)
         self.assertEqual(result.state, "rounds_exhausted")
         self.assertEqual([c for c in self.harness.calls if c["mode"] == "acceptance"], [])
         self.assertEqual([v["approved"] for v in self.of(result, "verifier_verdict")], [False, True])

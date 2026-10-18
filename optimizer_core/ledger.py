@@ -7,6 +7,7 @@ Never grant a candidate write access to this directory.
 import os
 from pathlib import Path
 import threading
+from contextlib import contextmanager
 
 from .canonical import canonical_json, digest, strict_json
 
@@ -55,7 +56,24 @@ def append_event(path, event):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with _lock_for(path):
-        return _append_locked(path, event)
+        with _process_lock(path):
+            return _append_locked(path, event)
+
+
+@contextmanager
+def _process_lock(path):
+    """Cross-process exclusive lock on a sidecar file (POSIX); a no-op where flock is unavailable."""
+    try:
+        import fcntl
+    except ImportError:  # Windows: single-process controller assumption, per-path thread lock only
+        yield
+        return
+    with open(str(path) + ".lock", "a") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def _append_locked(path, event):
